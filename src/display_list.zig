@@ -181,3 +181,18 @@ test "clips nest, glyphs stay out of quad batches, same clip is one batch" {
     try std.testing.expectEqual(@as(usize, 1), plan.glyph_count);
     try std.testing.expect(plan.batches[0].clip == null);
 }
+
+test "display list growth keeps the first quad" {
+    var arena = try FrameArena.init(std.testing.allocator, 64);
+    defer arena.deinit();
+    var list = DisplayList.init(&arena);
+    try list.addQuad(.{ .rect = math.Rect.init(1, 2, 3, 4), .fill = math.Color.white });
+    for (0..32) |_| {
+        try list.addQuad(.{ .rect = math.Rect.init(0, 0, 1, 1), .fill = math.Color.black });
+    }
+    try std.testing.expectEqual(@as(f32, 1), list.commands[0].quad.rect.x);
+    try std.testing.expectEqual(@as(f32, 3), list.commands[0].quad.rect.width);
+    const plan = try list.buildDraw();
+    try std.testing.expectEqual(@as(usize, 33), plan.quads.len);
+    try std.testing.expectEqual(@as(f32, 1), plan.quads[0].rect.x);
+}

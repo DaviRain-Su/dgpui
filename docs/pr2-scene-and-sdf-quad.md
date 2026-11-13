@@ -8,11 +8,11 @@
 
 现在仓库里有这些：
 
-- `FrameArena`：这一帧的清单从一块缓冲区里拨指针分配。`reset` 只把游标拨回 0，容量留着。它还不放 UI 树。
+- `FrameArena`：这一帧的清单从缓冲区里拨指针分配。不够用时另开一块，旧块留到 `reset`，已经返回的切片在本帧内仍然有效。它还不放 UI 树。
 - `DisplayList`：命令是 `quad`、`push_clip`、`pop_clip`、`glyph`。裁剪在记录时就和栈顶求交，结果记在 quad 上。
 - `DamageRegion`：几个脏矩形并成一个。`null` 仍然表示整屏。
 - `sdRoundedBox`：CPU 上的有向距离。点在圆角矩形里面是负数，外面是正数。片元着色器用同一公式。
-- `QuadRenderer.paint`：同一裁剪的 quad 放进一个实例缓冲，一次 `SDL_DrawGPUPrimitives`。有脏区时 `LOADOP_LOAD`，剪刀是脏区和裁剪的交。
+- `QuadRenderer.paint`：同一裁剪的 quad 放进一个实例缓冲，一次 `SDL_DrawGPUPrimitives`。局部更新画在自己的离屏纹理上（`LOADOP_LOAD` + 剪刀），再把整张纹理贴到交换链。交换链是只写的，不能拿来存上一帧。片元着色器输出预乘颜色，源颜色混合系数是 `ONE`。
 
 `glyph` 只占一个命令，不画。那是 PR 3。
 
@@ -23,7 +23,7 @@
 1. 回调自己 `arena.reset()`，再往 `DisplayList` 里塞 quad。
 2. 回调交回一个 `damage`。没有就整屏。
 3. Headless 把清单收成批，记下 quad 数、批次数、要不要整屏清、剪刀有多大。
-4. SDL 有 SPIR-V 时按批上传实例，设置剪刀，画 6 个顶点乘实例数。没有 SPIR-V（例如只有 Metal 字节码的机器）就退回清屏，并打错误日志。
+4. SDL 有 SPIR-V 时按批上传实例，画到一张持久纹理上，再整张贴到交换链。没有 SPIR-V 就整屏清交换链，并打错误日志。
 
 demo 第一帧脏区是空的，整屏清，画出底板和一个圆角按钮。之后点击只把按钮的可视范围（含阴影那一圈）标成脏区，屏外像素留着。
 

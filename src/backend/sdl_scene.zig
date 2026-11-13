@@ -44,6 +44,11 @@ pub const QuadRenderer = struct {
     instance_buffer: ?*c.SDL_GPUBuffer = null,
     unit_transfer: ?*c.SDL_GPUTransferBuffer = null,
     instance_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    scene: ?*c.SDL_GPUTexture = null,
+    scene_w: u32 = 0,
+    scene_h: u32 = 0,
+    scene_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_INVALID,
+    scene_needs_clear: bool = true,
     unit_uploaded: bool = false,
     failed: bool = false,
 
@@ -55,6 +60,7 @@ pub const QuadRenderer = struct {
         if (self.instance_buffer) |b| c.SDL_ReleaseGPUBuffer(self.device, b);
         if (self.unit_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(self.device, t);
         if (self.instance_transfer) |t| c.SDL_ReleaseGPUTransferBuffer(self.device, t);
+        if (self.scene) |tex| c.SDL_ReleaseGPUTexture(self.device, tex);
         self.pipeline = null;
         self.vert_shader = null;
         self.frag_shader = null;
@@ -62,6 +68,10 @@ pub const QuadRenderer = struct {
         self.instance_buffer = null;
         self.unit_transfer = null;
         self.instance_transfer = null;
+        self.scene = null;
+        self.scene_w = 0;
+        self.scene_h = 0;
+        self.scene_needs_clear = true;
         self.unit_uploaded = false;
     }
 
@@ -98,20 +108,41 @@ pub const QuadRenderer = struct {
             };
         }
 
+        const use_scene = self.ensureScene(format, pixel_w, pixel_h);
+        // 交换链纹理是只写的，不能 LOAD 上一帧。局部更新画在我们自己的纹理上，再整张贴到交换链。
+        const gpu_plan = if (use_scene) plan else damage.presentPlan(null, params.logical_size.width, params.logical_size.height, params.scale_factor);
+        const clear_full = gpu_plan.clear_full or self.scene_needs_clear or !use_scene;
+        if (use_scene) self.scene_needs_clear = false;
+
         var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
-        color_target.texture = tex;
+        color_target.texture = if (use_scene) self.scene.? else tex;
         color_target.clear_color = .{
             .r = params.clear_color.r,
             .g = params.clear_color.g,
             .b = params.clear_color.b,
             .a = params.clear_color.a,
         };
-        color_target.load_op = if (plan.clear_full) c.SDL_GPU_LOADOP_CLEAR else c.SDL_GPU_LOADOP_LOAD;
+        color_target.load_op = if (clear_full) c.SDL_GPU_LOADOP_CLEAR else c.SDL_GPU_LOADOP_LOAD;
         color_target.store_op = c.SDL_GPU_STOREOP_STORE;
+        color_target.cycle = false;
 
         const pass = c.SDL_BeginGPURenderPass(cmd, &color_target, 1, null) orelse return;
-        defer c.SDL_EndGPURenderPass(pass);
+        self.drawQuads(cmd, pass, pixel_w, pixel_h, params.scale_factor, gpu_plan, draw);
+        c.SDL_EndGPURenderPass(pass);
 
+        if (use_scene) self.blitScene(cmd, tex, pixel_w, pixel_h);
+    }
+
+    fn drawQuads(
+        self: *QuadRenderer,
+        cmd: *c.SDL_GPUCommandBuffer,
+        pass: *c.SDL_GPURenderPass,
+        pixel_w: u32,
+        pixel_h: u32,
+        scale: f32,
+        plan: damage.PresentPlan,
+        draw: ?display_list.DrawPlan,
+    ) void {
         const drawable = draw orelse return;
         const pipeline = self.pipeline orelse return;
         const unit = self.unit_buffer orelse return;
@@ -140,7 +171,7 @@ pub const QuadRenderer = struct {
         for (drawable.batches) |batch| {
             if (batch.count == 0 or batch.first >= limit) continue;
             const count = @min(batch.count, limit - batch.first);
-            const scissor = batchScissor(plan.scissor, batch.clip, params.scale_factor);
+            const scissor = batchScissor(plan.scissor, batch.clip, scale);
             if (scissor.width <= 0 or scissor.height <= 0) continue;
             var rect = std.mem.zeroes(c.SDL_Rect);
             rect.x = @intFromFloat(@floor(scissor.x));
@@ -151,6 +182,50 @@ pub const QuadRenderer = struct {
             c.SDL_SetGPUScissor(pass, &rect);
             c.SDL_DrawGPUPrimitives(pass, 6, @intCast(count), 0, @intCast(batch.first));
         }
+    }
+
+    fn ensureScene(self: *QuadRenderer, format: c.SDL_GPUTextureFormat, width: u32, height: u32) bool {
+        if (width == 0 or height == 0) return false;
+        if (self.scene) |tex| {
+            if (self.scene_w == width and self.scene_h == height and self.scene_format == format) return true;
+            c.SDL_ReleaseGPUTexture(self.device, tex);
+            self.scene = null;
+        }
+        var info = std.mem.zeroes(c.SDL_GPUTextureCreateInfo);
+        info.type = c.SDL_GPU_TEXTURETYPE_2D;
+        info.format = format;
+        info.usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        info.width = width;
+        info.height = height;
+        info.layer_count_or_depth = 1;
+        info.num_levels = 1;
+        info.sample_count = c.SDL_GPU_SAMPLECOUNT_1;
+        self.scene = c.SDL_CreateGPUTexture(self.device, &info);
+        if (self.scene == null) {
+            std.log.err("SDL_CreateGPUTexture for scene failed: {s}", .{c.SDL_GetError()});
+            return false;
+        }
+        self.scene_w = width;
+        self.scene_h = height;
+        self.scene_format = format;
+        self.scene_needs_clear = true;
+        return true;
+    }
+
+    fn blitScene(self: *QuadRenderer, cmd: *c.SDL_GPUCommandBuffer, swapchain: *c.SDL_GPUTexture, width: u32, height: u32) void {
+        const src = self.scene orelse return;
+        var info = std.mem.zeroes(c.SDL_GPUBlitInfo);
+        info.source.texture = src;
+        info.source.w = width;
+        info.source.h = height;
+        info.destination.texture = swapchain;
+        info.destination.w = width;
+        info.destination.h = height;
+        info.load_op = c.SDL_GPU_LOADOP_DONT_CARE;
+        info.filter = c.SDL_GPU_FILTER_NEAREST;
+        info.flip_mode = c.SDL_FLIP_NONE;
+        info.cycle = false;
+        c.SDL_BlitGPUTexture(cmd, &info);
     }
 
     fn ensurePipeline(self: *QuadRenderer, format: c.SDL_GPUTextureFormat) void {
@@ -181,7 +256,7 @@ pub const QuadRenderer = struct {
 
         var blend = std.mem.zeroes(c.SDL_GPUColorTargetBlendState);
         blend.enable_blend = true;
-        blend.src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+        blend.src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE;
         blend.dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
         blend.color_blend_op = c.SDL_GPU_BLENDOP_ADD;
         blend.src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE;

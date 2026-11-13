@@ -52,7 +52,7 @@
 
 **这层干什么。** 清单像点菜单：圆角矩形、一段裁剪、一个字形。厨房（显卡）不看你的组件树。字形图集是一张大贴图，把「你」这个字的小图存进去，下次同一字号直接贴，不必重新光栅化。原文这层写的是 display list、wgpu、glyph atlas。wgpu 是 Rust 里常见的 GPU 接口；图集是为了少绑纹理、少发绘制命令。
 
-**dgpui 现在做到哪。** `DisplayList` 能记 `quad`、`push_clip` / `pop_clip`、`glyph`。裁剪在 CPU 上求交，记在每个 quad 上。连续、裁剪相同的 quad 合成一批。`DamageRegion` 把脏矩形并起来；`null` 仍表示整屏。`presentPlan` 决定整屏清还是只留一块剪刀。SDF 的距离公式在 `src/sdf.zig`，GPU 上是 `src/shaders/quad.vert` / `quad.frag`，由 `QuadRenderer.paint` 实例化绘制。`damage_rect` 有值时用 `LOADOP_LOAD`，不再整屏清掉外面。`glyph` 只占清单位置，不画。没有字形图集。GPU 接口仍是 `SDL_GPU`，不是 wgpu。着色器只提交了 SPIR-V，Metal 的 MSL 还没生成。
+**dgpui 现在做到哪。** `DisplayList` 能记 `quad`、`push_clip` / `pop_clip`、`glyph`。裁剪在 CPU 上求交，记在每个 quad 上。连续、裁剪相同的 quad 合成一批。`DamageRegion` 把脏矩形并起来；`null` 仍表示整屏。`presentPlan` 决定整屏清还是只留一块剪刀。SDF 的距离公式在 `src/sdf.zig`，GPU 上是 `src/shaders/quad.vert` / `quad.frag`，由 `QuadRenderer.paint` 实例化画到一张自己的纹理上，再整张贴到交换链。交换链纹理是只写的，不能拿来保存上一帧。`glyph` 只占清单位置，不画。没有字形图集。GPU 接口仍是 `SDL_GPU`，不是 wgpu。着色器只提交了 SPIR-V，Metal 的 MSL 还没生成。片元着色器写出的是预乘颜色，混合的源颜色系数是 `ONE`。
 
 **还没做。** 模板缓冲那种「一次 draw 穿过不同裁剪」没做，不同裁剪就分批。超过 128 个 quad 的后半截这一帧不画。PR 3 才画字形。复杂路径（贝塞尔）不在范围内。
 
@@ -89,7 +89,7 @@
 3. `translateSdlEvent` 把 SDL 事件变成 `platform.Event`。改大小或换屏会 `refreshMetrics`。鼠标坐标用缓存换到逻辑空间。文本走 `queueTextInputChunks`。
 4. `handleEvent`。退出就停。`resized` / `scale_changed` 调用 `RendererBackend.resize`，记下像素宽高。SDL_GPU 没有单独的 `resize(宽, 高)`，交换链要等下一次 acquire 才按新像素重建。其它输入交给 `main.zig` 的回调。点击只会改 `clear_color` 并 `requestRedraw`。**还没做：** 命中测试、改 `Entity`、标脏区。
 5. `pollEvent` 把同一批剩下的事件吃完。多次 `requestRedraw` 只把 `needs_redraw` 设成真一次。
-6. 需要画时，如果挂了 `frame_build`，回调在 `FrameArena` 里填 `DisplayList`，并给出 `damage`。`drawOnce` 把它们放进 `renderFrame`。Headless 记下 quad 数、批次数和剪刀。SDL 在有 SPIR-V 时按批画圆角矩形；没有着色器格式就只清屏。`damage == null` 整屏 `LOADOP_CLEAR`。有脏区则 `LOADOP_LOAD`，剪刀是脏区和裁剪的交。**还没做：** 组件树、布局、文字测量、字形、命中测试。调用方要自己说哪块脏了，框架不会自动 diff 两帧。
+6. 需要画时，如果挂了 `frame_build`，回调在 `FrameArena` 里填 `DisplayList`，并给出 `damage`。`drawOnce` 把它们放进 `renderFrame`。Headless 记下 quad 数、批次数和剪刀。SDL 在有 SPIR-V 时先画到自己的纹理（脏区用 `LOADOP_LOAD` 和剪刀），再整张贴到交换链；没有着色器格式就整屏清交换链。**还没做：** 组件树、布局、文字测量、字形、命中测试。调用方要自己说哪块脏了，框架不会自动 diff 两帧。
 
 Headless 走同一条 `AppLoop`。差别只是事件是测试塞进去的，`renderFrame` 只计数，不碰 GPU。合并重绘的测试在 `src/app.zig`。
 
