@@ -1,6 +1,8 @@
 # 面试概念对照表：从 `dgpui` (Zig) 映射到 Rust GUI 框架岗位
 
-这份文档帮你把在 `dgpui` 里亲手写的每一段 Zig 代码，直接对应到 Rust GUI 核心岗位面试时的高频术语与设计取舍。
+这份文档把 `dgpui` 的设计对应到 Rust GUI 岗位面试里的高频术语。
+
+> 截至 PR 1，代码里真正有的是 `PlatformBackend` / `RendererBackend`、Headless、SDL3 窗口和事件循环、`math.zig`。下文里的 `Entity`、`FrameArena`、`DisplayList`、HarfBuzz、Flex **都是目标设计，不是已经落地的代码**。没有单独标「已实现」的段落，默认是计划。实现是 AI 辅助的，设计与审查由本人负责。
 
 ---
 
@@ -29,8 +31,10 @@
 2. **为什么用 `EntityId`（index + generation）而不是到处 `Rc<RefCell<T>>`？**
    - GUI 事件经常发生“A 的回调修改了 B，同时 B 正在遍历或又通知了 A”（重入借用冲突）。
    - 用句柄 + 中央 `EntityStore`（类似 SlotMap / generational arena），可以通过 `cx.update_entity(id, |state, cx| ...)` 集中控制可重入借用，避免 `RefCell` 运行时 panic。
-3. **FFI 与 `unsafe` 边界（HarfBuzz / FreeType2 / SDL3 / Yoga）**
+3. **FFI 与 `unsafe` 边界（当前是 SDL3；HarfBuzz / FreeType2 是后续计划）**
+   - 本仓库不链接 Yoga。Flex 若要做，是手写的小引擎，只参考 Yoga / Taffy 的模型。
    - 底层 C 库需要手工管理生命周期、字节切片对齐和编码格式（UTF-8 到 glyph index），在 Rust 中应当把 `unsafe` 封装在极薄的安全 wrapper 模块内部（如 `FontSystem`、`PlatformBackend`），对外只暴露安全句柄和值类型。
+   - 已实现的例子：`src/backend/sdl.zig` 把 SDL 事件翻译成值类型的 `platform.Event`，文本按码点边界拷进定长缓冲，不把 SDL 的指针漏到循环外面。
 
 ---
 
@@ -45,7 +49,8 @@
 - **`Vello`**：纯 Rust 现代 GPU-first 2D 矢量渲染引擎，**核心利用 GPU Compute Shader（计算着色器）做并行路径光栅化**，跑在 `wgpu` 之上。
 
 ### 局部重绘（Damage Region）与裁剪（Scissor）
-- `dgpui` 的策略：**脏视图触发重建 DisplayList -> 计算变化的 Damage Bounds（脏矩形并集）-> 渲染后端根据 Damage Region + Scissor Rect 控制重绘边界**。
+- **计划中的策略**：**脏视图触发重建 DisplayList -> 计算变化的 Damage Bounds（脏矩形并集）-> 渲染后端根据 Damage Region + Scissor Rect 控制重绘边界**。
+- **PR 1 的现状**：`FrameParams.damage_rect` 已经在渲染接口上，Headless / SDL 都会把它记下来。SDL 这一帧仍然 `LOADOP_CLEAR` 整屏，没有 scissor。`null` 表示整屏。
 - 注意表述边界：除非专门实现了离屏纹理缓存（Offscreen Layer Cache / RenderTarget Cache），否则不要把“脏矩形计算 + Scissor 裁剪”夸大成“完整的多层离屏图层缓存”。
 
 ### 桌面窗口后端 vs 嵌入式 DRM/KMS

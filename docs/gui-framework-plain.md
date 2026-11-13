@@ -1,0 +1,146 @@
+# 用大白话讲 GUI 框架
+
+给周一面试用。十分钟能读完。对照的是 AKR 那篇《vibe 一个你自己的 GUI 框架》的五层切法，例子换成这个仓库里真有的代码。
+
+先记住一句：GUI 框架就是一台翻译机。你用比较好写的方式描述界面，它算出每个盒子在屏幕上的位置，再把「画什么」交给显卡，最后听操作系统说鼠标点在哪。
+
+`dgpui` 现在只做完最底下那一层的窗口和事件，外加一块清屏。上面四层大多还是路线图。实现是 AI 辅助的：方向、拆任务、审代码、跑例子是我的。
+
+路线图是 6 个 PR。PR 1 已有代码。PR 2 到 PR 6 还没开始写。
+
+---
+
+## 第 1 层：怎么写界面
+
+**一句话讲清：** 让人用几行代码说出「这里有个按钮」，而不是手写每个像素的坐标。
+
+**这层干什么。** 像点菜：你说「一个蓝底卡片，里面一行字」，不说「字放在 x=16」。这层通常叫 DSL 或组件层。链式写法就是普通函数一个接一个；编译期写法是另一门小语言，编译时变成那些函数调用。
+
+**dgpui 现在做到哪。** 还没做。没有 `div()`，没有组件。`src/main.zig` 里的 `DemoState.onEvent` 只是收到鼠标按下就换一下清屏颜色，再调用 `AppLoop.requestRedraw`。
+
+**还没做。** PR 4 计划写 GPUI 风格的链式界面，再加一个小 Flex。PR 6 用 Zig 的 `comptime` 做一份声明式写法，拿来和链式写法对比。主路径按 `docs/interview-map.md` 是链式，不是另做一门编译器。
+
+---
+
+## 第 2 层：记住什么，什么时候重算
+
+**一句话讲清：** 按钮上的数字要活过很多帧，这一帧的界面树画完就可以扔掉。
+
+**这层干什么。** 柜台的账本和一次性的草稿纸不是一回事。账本是计数器、滚动位置，要一直留着。草稿纸是「这一帧有哪些盒子」，画完就撕。四种常见做法放在文末「流派对比」。这里只记区别：有的框架每帧把界面函数重跑一遍，有的拿新旧两棵树做差，有的一个数据变了只通知订过它的人，有的在编译时就把通知关系算死。
+
+**dgpui 现在做到哪。** 组件树还没做，`FrameArena` 和 `EntityStore` 都没有源文件。已经有的是更小的一件事：同一批事件里多次要求重画，只画一次。`AppLoop.run` 用 `needs_redraw` 这一个布尔值合并。这不是组件级增量更新。
+
+**还没做。** 文档里的目标是：持久状态放 `Entity`，视图脏了就从帧内存里重建一棵轻量树，不做 React 那种虚拟 DOM diff，也不做 Signal 那种细粒度依赖图。`Entity`、`observe` / `notify`、Hitbox 排在 PR 5。帧内存池排在 PR 2，和绘制清单一起做。
+
+---
+
+## 第 3 层：盒子放哪，字有多宽
+
+**一句话讲清：** 你只说「横着排、间距 8」，框架算出每个矩形的 x、y、宽、高；字的宽度要问字体，不能用字数乘字号。
+
+**这层干什么。** 搬家时你说「沙发靠墙、茶几在前」，不报每个脚的坐标。窗口变窄，字要折行，下面的按钮就得往下挪。所以布局是单独一层：它吃约束，吐矩形。文字测量是布局的尺子。`fi` 可能连成一个字形，中英混排的宽度也不等于字符个数。
+
+**dgpui 现在做到哪。** 还没做布局，也还没做文字测量。`src/math.zig` 只有 `Point`、`Rect`、`Color`，以及以后脏区会用到的 `unionWith`、`intersect`。没有 Flex，没有 Grid，没有 HarfBuzz。
+
+**还没做。** PR 4 计划手写一个小 Flex，测量文字时走 `measure` 回调。思路参考 Taffy / Yoga，不链接这两个库。真正的整形和折行排在 PR 3（HarfBuzz + FreeType）。
+
+---
+
+## 第 4 层：画到屏幕上
+
+**一句话讲清：** 先列一张和显卡无关的清单，再让 GPU 按清单画；常用的字预先贴进一张大图里，避免每个字都单独画一次。
+
+**这层干什么。** 清单像点菜单：圆角矩形、一段裁剪、一个字形。厨房（显卡）不看你的组件树。字形图集是一张大贴图，把「你」这个字的小图存进去，下次同一字号直接贴，不必重新光栅化。原文这层写的是 display list、wgpu、glyph atlas。wgpu 是 Rust 里常见的 GPU 接口；图集是为了少绑纹理、少发绘制命令。
+
+**dgpui 现在做到哪。** 只有清屏。`RendererBackend.renderFrame`（`src/backend/sdl.zig`）拿到 `FrameParams` 后，用 `SDL_WaitAndAcquireGPUSwapchainTexture` 取交换链，再 `LOADOP_CLEAR` 整屏填成 `clear_color`。`damage_rect` 会记到 `last_damage_rect`，代码里标了 `TODO(PR2)`，还没有剪刀裁剪。没有 DisplayList，没有 SDF 着色器，没有字形图集。GPU 接口是 `SDL_GPU`（macOS 上走 Metal），不是 wgpu。
+
+**还没做。** PR 2：DisplayList、脏区并集、SDF 画圆角。PR 3：字形图集。wgpu 只是面试时的对照词，仓库不计划先换掉 SDL_GPU。
+
+---
+
+## 第 5 层：窗口、点击、输入法
+
+**一句话讲清：** 没人操作时线程睡觉；有事件时把系统坐标翻成框架自己的逻辑坐标，再决定要不要画一帧。
+
+**这层干什么。** 前台。操作系统发来鼠标、键盘、缩放。框架要回答三件事：点中了哪个控件（hit test）、键盘该进哪个输入框（焦点）、中文输入法正在组字时那一串还没上屏的字怎么显示（IME）。无障碍是把这棵界面告诉读屏软件，常见接法是 AccessKit。原文这层用 winit；这个仓库用 SDL3，角色一样：要窗口、要事件，不要把上层绑死在某一个窗口库上。
+
+**dgpui 现在做到哪。** 这一层有代码，但只到「窗口 + 翻译事件 + 清屏」。
+
+- 两套接口：`src/backend/platform.zig` 的 `PlatformBackend`，`src/backend/renderer.zig` 的 `RendererBackend`。都是手写 VTable（数据指针加函数表）。
+- 桌面实现：`src/backend/sdl.zig` 的 `SdlBackend`。`SDL_WaitEvent` 没事件就阻塞，`SDL_PollEvent` 把积压的一次取完。
+- 无窗口实现：`src/backend/headless.zig` 的 `HeadlessBackend`。测试往队列里塞假事件，不弹窗。
+- 循环：`src/app.zig` 的 `AppLoop.run`。先 `waitEvent`，再 `pollEvent` 排空，最后看 `needs_redraw` 决定画不画。
+- 像素：`metricsFromPlatformSizes` 在同时拿到像素和内容缩放时，逻辑尺寸 = 像素 / `content_scale`。`scale_factor` 这时就是内容缩放。`pixel_density` 另记。交换链尺寸用 `SDL_GetWindowSizeInPixels`。`physicalWidth` 优先返回这个像素值。
+- 建窗：`init` 的宽高是期望的逻辑尺寸。`adjustWindowToRequestedLogical` 会在 Windows/X11 200% 这种「窗口坐标已经是像素」的情况下把窗口放大，避免 800×600 的请求变成 400×300 的逻辑尺寸。macOS 上窗口坐标本来就是点，这个比例是 1，不会再放大。
+- 鼠标：`windowToLogical` 用缓存的窗口坐标和逻辑尺寸做乘法。缓存只在缩放、改大小、换屏时由 `refreshMetrics` 更新。
+- 文本：`queueTextInputChunks` 把超长 `TEXT_INPUT` 按 UTF-8 码点切成多条，每条最多 `text_byte_cap`（256）字节。非法字节换成 U+FFFD。内存不够时回滚分片，打日志，只发出第一段前缀。`TEXT_EDITING` 译成 `text_editing`。界面不画这串预编辑。候选词事件没有译。
+- 重绘唤醒：`requestRedraw` 在还没标脏时，用 SDL 自定义事件把睡着的 `waitEvent` 叫醒。
+
+**还没做。** 命中测试和事件冒泡是 PR 5。焦点、键盘分发、滚动裁剪是 PR 6。输入法只翻译到事件，没有候选框，也没有把预编辑画出来。AccessKit 不在这 6 个 PR 里，无障碍方案待定。
+
+---
+
+## 一帧是怎么走的
+
+下面按 `AppLoop.run` 的真实顺序。标了「还没做」的步骤，代码里没有。
+
+1. 启动先画一帧。`needs_redraw` 初始是真，`drawOnce` 清一次屏。这时还没有组件树。
+2. `waitEvent` 阻塞。SDL 后端先看有没有上次没发完的文本分片（`popPending`），没有就 `SDL_WaitEvent`。CPU 在这里等。
+3. `translateSdlEvent` 把 SDL 事件变成 `platform.Event`。改大小或换屏会 `refreshMetrics`。鼠标坐标用缓存换到逻辑空间。文本走 `queueTextInputChunks`。
+4. `handleEvent`。退出就停。`resized` / `scale_changed` 调用 `RendererBackend.resize`，记下像素宽高。SDL_GPU 没有单独的 `resize(宽, 高)`，交换链要等下一次 acquire 才按新像素重建。其它输入交给 `main.zig` 的回调。点击只会改 `clear_color` 并 `requestRedraw`。**还没做：** 命中测试、改 `Entity`、标脏区。
+5. `pollEvent` 把同一批剩下的事件吃完。多次 `requestRedraw` 只把 `needs_redraw` 设成真一次。
+6. 需要画时 `drawOnce` 读缓存的 `metrics()`，调用 `renderFrame`。`damage_rect` 传的是空，表示整屏。SDL 用 `LOADOP_CLEAR` 清掉交换链。**还没做：** 建树、布局、文字测量、DisplayList、字形、按脏矩形裁剪。
+
+Headless 走同一条 `AppLoop`。差别只是事件是测试塞进去的，`renderFrame` 只计数，不碰 GPU。合并重绘的测试在 `src/app.zig`。
+
+---
+
+## 流派对比
+
+| 做法 | 一句话 | 好处 | 代价 |
+| :--- | :--- | :--- | :--- |
+| 每帧重建（egui 这种立即模式） | 每帧把界面函数重跑一遍，当场算位置、当场画 | 好懂，少一份「界面和数据不一致」 | 后一个控件很难影响前一个控件的大小；动画和无障碍更费劲 |
+| Diff（React 虚拟 DOM） | 留下上一棵树，和这一棵比，只改变了的节点 | 局部更新直观 | 要维护两棵树，比较本身有成本 |
+| Signal | 数据像表格单元格，改一格只通知订过它的公式 | 更新面可以很小 | 依赖关系要小心，重入和调试更绕 |
+| 编译期（Svelte / Slint） | 编译时算出「谁变了要刷新谁」 | 运行时可以很瘦 | 得维护编译器和报错信息 |
+
+`dgpui` 打算走哪条，以 `docs/interview-map.md` 为准：持久状态留在 `Entity` 里，脏了就重建这一帧的轻量元素树，不做虚拟 DOM diff，也不是 Signal。链式 Builder 是主写法。PR 6 才会拿 `comptime` 和这条链式写法对比，不是现在就改成编译期框架。无障碍接哪套库，待定。
+
+---
+
+## 面试怎么聊
+
+### 30 秒开场
+
+我在用 Zig 0.17 写一个教学用的迷你 GUI 框架，叫 dgpui。目标是自己把五层走通：界面怎么写、状态怎么留、布局和文字、绘制清单、窗口和输入。现在仓库里真正能跑的是最底下一层：SDL3 开窗，没事件就睡，一批事件只画一次，分清逻辑像素和物理像素，文本按 UTF-8 切成 256 字节一块。组件、布局、字形、命中测试都还在文档里，代码没写。实现是 AI 辅助的。我定方向、拆任务、审 diff、跑 headless 测试和清屏窗口。
+
+### 高频问题
+
+1. **为什么先 `waitEvent` 再排空？** 没事件时阻塞，CPU 接近空闲。醒来后用 `pollEvent` 把这一批取完，多次请求重绘只留一个 `needs_redraw`，最后画一帧。测试断言这种情况下总帧数是 2：开头一帧，加上合并后的一帧。
+2. **逻辑像素和物理像素？** 布局用逻辑尺寸。交换链用 `SDL_GetWindowSizeInPixels` 的像素。有内容缩放时，逻辑尺寸 = 像素 / `content_scale`。`scale_factor` 这时等于内容缩放。`pixel_density` 是另一件事：一个窗口坐标对应多少像素。
+3. **Retina 和 Windows 200% 差在哪？** macOS 的窗口坐标是点，高分屏上像素大约是点的 2 倍，鼠标几乎不用再缩放。Windows / X11 200% 时窗口坐标常常已经是像素，内容缩放是 2，逻辑尺寸大约是窗口坐标的一半，鼠标要乘 `逻辑 / 窗口坐标`。所以 `SDL_CreateWindow(800, 600)` 在后者上得先把窗口坐标放大，请求的逻辑尺寸才对得上。
+4. **为什么要合并重绘？** 拖动窗口时一帧里会来很多 resize。每个都画，GPU 白忙。布尔值合并后，这一批只提交一次清屏。
+5. **后台改了状态，怎么叫醒正在 `waitEvent` 里睡觉的线程？** `requestRedraw` 用 SDL 注册的自定义事件 `SDL_PushEvent`。翻译成 `.redraw_requested`。Headless 里则只是把计数加一，因为测试不需要真睡死。
+6. **IME 为什么难？** 上屏前有一串还在变的预编辑，还有候选框，光标位置按字符计。SDL 的字符串指针只在这一次取事件时有效，所以要立刻拷进自己的缓冲。超长要按码点切开，不能切在汉字中间。我们译了 `text_input` 和 `text_editing`，界面还没画预编辑，候选词也没译。
+7. **为什么文字要字形图集？** 显卡不认识字体文件。每个字形先变成小图，塞进一张大纹理，记下图集坐标。同一张纹理可以画很多字。还没做，在 PR 3。宽度也不能用字数乘字号，因为有连字和混排，那是 HarfBuzz 的活，也还没做。
+8. **布局为什么单独一层？** 绘制和窗口都不该知道「Flex 怎么分配剩余宽度」。布局只产出矩形。字有多宽是测量回调的事，所以文字测量和布局挨着，但不等于把字体库写进布局里。还没做，在 PR 4。
+9. **VTable 是什么？** 一个对象指针加一张函数表。上层只认 `PlatformBackend` / `RendererBackend`。换 SDL、换 Headless，`AppLoop` 不用改。和 Rust 的 `dyn Trait` 同类，只是 Zig 要自己保证类型转换是对的。
+10. **无障碍怎么接？** 还没做，6 个 PR 里没有 AccessKit。真要做，是在有了稳定的控件树和焦点之后，把角色、名字、边界同步给读屏，而不是在清屏这一层硬接。
+
+### 别硬扛
+
+没做过的就说没做，再补一句它排在哪。
+
+| 被问到 | 可以这么说 |
+| :--- | :--- |
+| 你的 DisplayList / SDF 圆角 | 还没做，排在 PR 2。现在每帧整屏 `LOADOP_CLEAR`，`damage_rect` 只是记下来。 |
+| 脏矩形优化做完了吗 | 没有。字段在，剪刀裁剪没有。 |
+| Flex / Yoga / Taffy | 还没做，排在 PR 4。打算自己写小 Flex，不链接 Yoga 或 Taffy。 |
+| HarfBuzz、字形图集 | 还没做，排在 PR 3。 |
+| 点击怎么命中按钮 | 还没做，排在 PR 5。现在点击只换清屏颜色。 |
+| 焦点和滚动 | 还没做，排在 PR 6。 |
+| 你用的是 wgpu 吗 | 不是。窗口和清屏是 SDL3 的 `SDL_GPU`。wgpu 是面试对照。 |
+| IME 界面做了吗 | 事件译了，预编辑没画，候选词没译。 |
+| 无障碍 | 待定，不在当前 6 个 PR 里。 |
+| 200% 缩放下你亲手量过窗口吗 | 公式有单测。这台环境是 1 倍缩放，Windows 和 Mac Retina 我没有开窗量过。 |
+| 代码是不是每行都自己敲的 | 不是。AI 辅助实现，我负责设计、审查和跑测试。 |

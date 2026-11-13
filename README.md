@@ -1,7 +1,9 @@
-# dgpui — 用 Zig 从零手写一个可理解的 mini-GPUI 框架
+# dgpui — 用 Zig 做一个可理解的 mini-GPUI 框架
 
 > 一个为**系统/语言背景开发者**打造的教育型桌面 GUI 框架（Zig 0.17.1）。
-> 目标：不靠黑盒魔法，亲手走通从 **DSL → 内存模型 → Flexbox 布局 → 文字排版 → 脏区与 Display List → GPU SDF 着色器 → 窗口与命中测试** 的完整闭环。
+> 目标：不靠黑盒魔法，走通从 **DSL → 内存模型 → Flexbox 布局 → 文字排版 → 脏区与 Display List → GPU SDF 着色器 → 窗口与命中测试** 的完整闭环。
+
+实现是 **AI 辅助** 的，设计、取舍和审查由本人负责。下面的五步闭环和 6 个 PR 是路线图。没有标成「已实现」的层，目前只有文档，没有对应代码。
 
 ---
 
@@ -10,6 +12,9 @@
 如果你没做过 GUI，可以先记住这条**永远不变的 5 步闭环**：
 
 ```text
+  （目标闭环。当前代码只做到了「没事件就休眠」的窗口循环，外加一个只清屏的 SDL_GPU 后端。
+   第 1–4 步，以及第 5 步里的 Hitbox / Entity，都还是计划。）
+
   1. 写界面 (DSL)
      div().bg(blue).child(text("点我: 0"))
           │
@@ -34,7 +39,7 @@
 
 ## 这个项目为什么要这么拆分？
 
-很多 GUI 教程上来就堆几十个文件。为了方便**边做边学、按 PR 逐个复习**，我们把整个框架拆成了 **6 个独立、可运行的 PR**，每个 PR 只解决一个核心问题：
+很多 GUI 教程上来就堆几十个文件。为了方便**边做边学、按 PR 逐个复习**，路线图拆成 **6 个 PR**。PR 1 已实现，PR 2–6 还没开始写代码：
 
 | PR | 分支名 | 解决什么问题（大白话） | 对应的核心技术 / 面试高频点 |
 | :--- | :--- | :--- | :--- |
@@ -47,18 +52,29 @@
 
 ---
 
-## 技术栈（全部本机原生零臃肿依赖）
+## 现在做到哪了
+
+| 层 | 状态 | 代码 |
+| :--- | :--- | :--- |
+| 几何（`Point` / `Rect` / `Color`） | **已实现** | `src/math.zig` |
+| 平台 / 渲染 VTable、Headless、事件循环 | **已实现** | `src/backend/platform.zig`、`renderer.zig`、`headless.zig`、`src/app.zig` |
+| SDL3 窗口、`SDL_GPU` 清屏、鼠标键盘、文本与 IME 事件 | **已实现**（机器上有 SDL3 开发包才编译） | `src/backend/sdl.zig` |
+| `damage_rect` | **只接到渲染接口**。SDL 仍整屏 `LOADOP_CLEAR`，局部重绘是 PR 2 | `src/backend/renderer.zig` |
+| `FrameArena`、`DisplayList`、SDF、HarfBuzz、FreeType、Flex、`Entity`、Hitbox、滚动、焦点 | **计划中** | 见 `docs/architecture.md`，仓库里还没有这些文件 |
+
+## 技术栈
 
 - **语言**：Zig `0.17.1`
-- **窗口与 GPU 抽象**：`SDL3` + `SDL_GPU`（macOS 自动跑 Metal，也可轻松替换成 `winit`/`wgpu` 或嵌入式 `DRM/KMS`）
-- **文本排版与光栅化**：`HarfBuzz` + `FreeType2` + 自写 Shelf `GlyphAtlas`
-- **布局与渲染核心**：100% 自己用 Zig 手写（`FrameArena`、`EntityStore`、Flex 引擎、`DisplayList`、SDF 着色器），不隐藏任何关键逻辑。
+- **当前依赖**：`SDL3` + `SDL_GPU`（macOS 上 SDL_GPU 走 Metal）。没有 SDL3 时，headless 测试照样能编、能跑。
+- **计划中的依赖**：HarfBuzz、FreeType2、自写 `GlyphAtlas`。布局打算自己写一个小 Flex，只参考 Yoga / Taffy 的模型，**不链接 Yoga**。
+- **写法**：AI 辅助实现，本人负责设计与审查。关键路径（事件循环、像素尺寸、文本截断）留在仓库里，不包一层不透明库。
 
 ---
 
 ## 阅读导航
 
 - [架构拆解与通俗图解 (`docs/architecture.md`)](docs/architecture.md) —— 建议先花 5 分钟读这一篇，把所有名词一次对齐。
+- [GUI 框架大白话（`docs/gui-framework-plain.md`）](docs/gui-framework-plain.md) —— 面试前十分钟：五层各自干什么、代码做到哪、一帧怎么走。
 - [Rust GUI 框架面试映射表 (`docs/interview-map.md`)](docs/interview-map.md) —— 把 `dgpui` 的每一行代码翻译成 Rust / Slint / egui / Iced / 渲染管线面试术语。
 
 ---
@@ -66,9 +82,14 @@
 ## 快速构建与测试
 
 ```bash
-# 运行所有无窗口单元测试（内存池、布局、脏区、命中测试等）
+# headless 单测：重绘合并、几何、UTF-8 截断、像素尺寸。不需要 SDL3。
 zig build test
 
-# 运行桌面 GUI 示例程序
+# 即使本机装了 SDL3，也只跑不链接 SDL 的测试。
+zig build test-headless
+
+# 桌面示例。Linux 走 pkg-config sdl3；macOS Homebrew 一般也能被探测到。
+# 探测失败时可以手动给路径：
+#   zig build run -Dsdl-include=/opt/homebrew/include -Dsdl-lib=/opt/homebrew/lib
 zig build run
 ```
