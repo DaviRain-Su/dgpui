@@ -39,7 +39,7 @@
 
 ## 这个项目为什么要这么拆分？
 
-很多 GUI 教程上来就堆几十个文件。为了方便**边做边学、按 PR 逐个复习**，路线图拆成 **6 个 PR**。PR 1 已实现，PR 2–6 还没开始写代码：
+很多 GUI 教程上来就堆几十个文件。为了方便**边做边学、按 PR 逐个复习**，路线图拆成 **6 个 PR**。PR 1 和 PR 2 已有代码，PR 3–6 还没开始写：
 
 | PR | 分支名 | 解决什么问题（大白话） | 对应的核心技术 / 面试高频点 |
 | :--- | :--- | :--- | :--- |
@@ -59,8 +59,8 @@
 | 几何（`Point` / `Rect` / `Color`） | **已实现** | `src/math.zig` |
 | 平台 / 渲染 VTable、Headless、事件循环 | **已实现** | `src/backend/platform.zig`、`renderer.zig`、`headless.zig`、`src/app.zig` |
 | SDL3 窗口、`SDL_GPU` 清屏、鼠标键盘、文本与 IME 事件 | **已实现**（机器上有 SDL3 开发包才编译） | `src/backend/sdl.zig` |
-| `damage_rect` | **只接到渲染接口**。SDL 仍整屏 `LOADOP_CLEAR`，局部重绘是 PR 2 | `src/backend/renderer.zig` |
-| `FrameArena`、`DisplayList`、SDF、HarfBuzz、FreeType、Flex、`Entity`、Hitbox、滚动、焦点 | **计划中** | 见 `docs/architecture.md`，仓库里还没有这些文件 |
+| `FrameArena`、`DisplayList`、脏区并集、圆角 SDF | **已实现（最小）**。`glyph` 只记录不画。着色器是 SPIR-V，MSL 还没做 | `src/frame_arena.zig`、`display_list.zig`、`damage.zig`、`sdf.zig`、`src/backend/sdl_scene.zig` |
+| HarfBuzz、FreeType、Flex、`Entity`、Hitbox、滚动、焦点、无障碍 | **还没做** | 见 `docs/architecture.md` 的 Step 3–6 |
 
 ## 技术栈
 
@@ -75,6 +75,7 @@
 
 - [架构拆解与通俗图解 (`docs/architecture.md`)](docs/architecture.md) —— 建议先花 5 分钟读这一篇，把所有名词一次对齐。
 - [GUI 框架大白话（`docs/gui-framework-plain.md`）](docs/gui-framework-plain.md) —— 面试前十分钟：五层各自干什么、代码做到哪、一帧怎么走。
+- [PR 2 学习笔记（`docs/pr2-scene-and-sdf-quad.md`）](docs/pr2-scene-and-sdf-quad.md) —— 绘制清单、脏区和圆角 SDF 这一步做了什么。
 - [Rust GUI 框架面试映射表 (`docs/interview-map.md`)](docs/interview-map.md) —— 把 `dgpui` 的每一行代码翻译成 Rust / Slint / egui / Iced / 渲染管线面试术语。
 
 ---

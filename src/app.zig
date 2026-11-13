@@ -8,9 +8,13 @@
 
 const std = @import("std");
 const math = @import("math.zig");
+const display_list = @import("display_list.zig");
+const FrameArena = @import("frame_arena.zig").FrameArena;
 const platform = @import("backend/platform.zig");
 const renderer = @import("backend/renderer.zig");
 const HeadlessBackend = @import("backend/headless.zig").HeadlessBackend;
+
+pub const FrameBuildFn = *const fn (ctx: *anyopaque, arena: *FrameArena) display_list.BuiltFrame;
 
 pub const AppCallbacks = struct {
     ctx: *anyopaque,
@@ -24,6 +28,10 @@ pub const AppLoop = struct {
     needs_redraw: bool = true,
     running: bool = true,
     callbacks: ?AppCallbacks = null,
+    /// 有的话，每帧先 `arena.reset` 的责任在回调里。没有就只清屏。
+    frame_ctx: ?*anyopaque = null,
+    frame_arena: ?*FrameArena = null,
+    frame_build: ?FrameBuildFn = null,
 
     pub fn init(
         platform_backend: platform.PlatformBackend,
@@ -102,12 +110,18 @@ pub const AppLoop = struct {
     fn drawOnce(self: *AppLoop) !void {
         self.needs_redraw = false;
         const m = self.platform_backend.metrics();
+        var built: ?display_list.BuiltFrame = null;
+        if (self.frame_build) |build| {
+            if (self.frame_arena) |arena| {
+                if (self.frame_ctx) |ctx| built = build(ctx, arena);
+            }
+        }
         try self.renderer_backend.renderFrame(.{
             .logical_size = m.logicalSize(),
             .scale_factor = m.scale_factor,
             .clear_color = self.clear_color,
-            // TODO(PR2): 这里还不会算脏区并集。null = 整屏。字段已经接到渲染后端，只是还不用来裁剪。
-            .damage_rect = null,
+            .damage_rect = if (built) |frame| frame.damage else null,
+            .display_list = if (built) |*frame| &frame.list else null,
         });
     }
 };
@@ -177,4 +191,48 @@ test "resize uses normalized metrics and keeps SizeInPixels" {
 
     try std.testing.expectEqual(@as(u32, 1600), hb.last_resize_physical.?.w);
     try std.testing.expectEqual(@as(u32, 1200), hb.last_resize_physical.?.h);
+}
+
+test "frame builder sends a display list and a partial damage rect" {
+    var arena = try FrameArena.init(std.testing.allocator, 8192);
+    defer arena.deinit();
+    var hb = HeadlessBackend.init(std.testing.allocator, .{
+        .logical_width = 400,
+        .logical_height = 300,
+        .scale_factor = 2,
+    });
+    defer hb.deinitSelf();
+
+    const Builder = struct {
+        fn build(ctx: *anyopaque, frame_arena: *FrameArena) display_list.BuiltFrame {
+            _ = ctx;
+            frame_arena.reset();
+            var list = display_list.DisplayList.init(frame_arena);
+            list.addQuad(.{
+                .rect = math.Rect.init(8, 8, 40, 20),
+                .radius = 4,
+                .fill = math.Color.white,
+            }) catch unreachable;
+            list.addQuad(.{
+                .rect = math.Rect.init(12, 10, 10, 10),
+                .fill = math.Color.black,
+            }) catch unreachable;
+            return .{
+                .list = list,
+                .damage = math.Rect.init(8, 8, 40, 24),
+            };
+        }
+    };
+
+    try hb.pushEvent(.redraw_requested);
+    var loop = AppLoop.init(hb.platformBackend(), hb.rendererBackend());
+    loop.frame_ctx = &loop;
+    loop.frame_arena = &arena;
+    loop.frame_build = Builder.build;
+    try loop.run();
+
+    try std.testing.expect(hb.last_quad_count >= 2);
+    try std.testing.expectEqual(@as(usize, 1), hb.last_batch_count);
+    try std.testing.expect(!hb.last_clear_full);
+    try std.testing.expect(hb.last_scissor.width > 0);
 }

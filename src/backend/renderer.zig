@@ -1,19 +1,21 @@
 //! 渲染后端抽象（RendererBackend）
 //!
 //! 为什么要把渲染也抽成接口？
-//! 框架前半段算出来的只是“在哪画什么”（PR 2 会引入与 GPU 无关的 DisplayList）。
+//! 框架前半段算出来的只是“在哪画什么”（`DisplayList`）。
 //! 真正把指令变成像素，可以接 Metal/Vulkan/wgpu，也可以接软件光栅或测试桩（Headless）。
 //! 这和 Slint 支持 FemtoVG / Skia / Software 多渲染后端是同一个架构思路。
 
 const math = @import("../math.zig");
+const display_list = @import("../display_list.zig");
 
 pub const FrameParams = struct {
     logical_size: math.Size,
     scale_factor: f32,
     clear_color: math.Color,
-    /// 脏区（逻辑像素）。null 表示整屏。
-    /// TODO(PR2): 局部重绘还没做。渲染后端要记下这个值，但本 PR 仍然整屏 clear，不按它做 scissor。
+    /// 脏区（逻辑像素）。null 表示整屏清。有值时只在这块里画，屏外像素保留。
     damage_rect: ?math.Rect = null,
+    /// 这一帧要画的清单。null 表示只清屏，和 PR 1 一样。
+    display_list: ?*const display_list.DisplayList = null,
 };
 
 pub const RendererBackend = struct {
@@ -21,7 +23,7 @@ pub const RendererBackend = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// 开始一帧渲染并提交本帧数据（后续 PR 2 会在这里传入 DisplayList）
+        /// 开始一帧渲染并提交本帧数据。`params.display_list` 里是圆角矩形命令。
         renderFrame: *const fn (ptr: *anyopaque, params: FrameParams) anyerror!void,
         /// 窗口像素尺寸变化时通知后端。
         /// SDL_GPU 没有 `resize(w, h)` 这种交换链 API：Vulkan 后端自己盯着
