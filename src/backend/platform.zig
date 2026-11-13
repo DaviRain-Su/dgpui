@@ -38,16 +38,17 @@ pub const KeyCode = enum {
 };
 
 pub const WindowMetrics = struct {
-    /// 窗口坐标里的宽高（`SDL_GetWindowSize`）。布局和命中测试只看这个值。
+    /// 归一化后的逻辑宽高（单位：逻辑点）。布局和命中测试只看这个值：
+    /// 有像素尺寸和 `content_scale` 时按 `pixel / content_scale` 计算，
+    /// 让 macOS Retina、Windows 200%、X11 拿到一致的逻辑坐标系。
     logical_width: f32,
     logical_height: f32,
-    /// 像素密度（`SDL_GetWindowPixelDensity`）：1 个窗口坐标对应多少物理像素。
-    /// macOS 打开 `SDL_WINDOW_HIGH_PIXEL_DENSITY` 时 Retina 通常是 2.0。
-    /// Windows 的窗口坐标本身就是像素，这里经常是 1.0，即使系统缩放是 200%。
+    /// 逻辑点到物理像素的缩放系数（`content_scale`，无 `SizeInPixels` 回退时为 `pixel_density`）。
     scale_factor: f32,
     /// 内容缩放（`SDL_GetWindowDisplayScale`）：系统希望 UI 放大多少。
-    /// 它不是像素密度。Windows 200% 时这个值可以是 2.0，但交换链像素不能用它去乘逻辑尺寸。
     content_scale: f32 = 1,
+    /// 原始 `SDL_GetWindowPixelDensity`：1 个 SDL 窗口坐标对应多少物理像素。
+    pixel_density: f32 = 1,
     /// `SDL_GetWindowSizeInPixels` 的宽。有值时 `physicalWidth` 直接用它。
     pixel_width: ?u32 = null,
     /// `SDL_GetWindowSizeInPixels` 的高。有值时 `physicalHeight` 直接用它。
@@ -90,26 +91,51 @@ pub const PlatformSizeQuery = struct {
 };
 
 pub fn metricsFromPlatformSizes(in: PlatformSizeQuery) WindowMetrics {
-    const logical_w: i32 = if (in.logical_width > 0) in.logical_width else 1;
-    const logical_h: i32 = if (in.logical_height > 0) in.logical_height else 1;
+    const win_w: i32 = if (in.logical_width > 0) in.logical_width else 1;
+    const win_h: i32 = if (in.logical_height > 0) in.logical_height else 1;
     const pixel_w = positivePixel(in.pixel_width);
     const pixel_h = positivePixel(in.pixel_height);
 
     const density = if (in.pixel_density > 0 and std.math.isFinite(in.pixel_density))
         in.pixel_density
     else if (pixel_w) |w|
-        @as(f32, @floatFromInt(w)) / @as(f32, @floatFromInt(logical_w))
+        @as(f32, @floatFromInt(w)) / @as(f32, @floatFromInt(win_w))
     else
         1;
-    const content = if (in.content_scale > 0 and std.math.isFinite(in.content_scale)) in.content_scale else 1;
+    const has_explicit_content = in.content_scale > 0 and std.math.isFinite(in.content_scale);
+    const content = if (has_explicit_content) in.content_scale else density;
+
+    // 当同时拿到权威物理像素 (`SizeInPixels`) 和 `content_scale` (`SDL_GetWindowDisplayScale`) 时，
+    // 用 `pixel / content_scale` 推导逻辑尺寸，消除 Windows/X11 与 macOS 窗口坐标语义差异。
+    const logical_w: f32 = if (pixel_w != null and has_explicit_content)
+        @max(1.0, @as(f32, @floatFromInt(pixel_w.?)) / content)
+    else
+        @floatFromInt(win_w);
+    const logical_h: f32 = if (pixel_h != null and has_explicit_content)
+        @max(1.0, @as(f32, @floatFromInt(pixel_h.?)) / content)
+    else
+        @floatFromInt(win_h);
 
     return .{
-        .logical_width = @floatFromInt(logical_w),
-        .logical_height = @floatFromInt(logical_h),
-        .scale_factor = density,
+        .logical_width = logical_w,
+        .logical_height = logical_h,
+        .scale_factor = if (pixel_w != null and has_explicit_content) content else density,
         .content_scale = content,
+        .pixel_density = density,
         .pixel_width = pixel_w,
         .pixel_height = pixel_h,
+    };
+}
+
+/// 将 SDL 窗口坐标（如 `motion.x/y`、`button.x/y`）归一到框架逻辑坐标系。
+/// - macOS Retina：`window_w == logical_width` -> 乘数 1.0
+/// - Windows/X11 200%：`window_w == 2 * logical_width` -> 乘数 0.5
+pub fn windowPointToLogical(window_w: i32, window_h: i32, metrics: WindowMetrics, pt: math.Point) math.Point {
+    const sx = if (window_w > 0) metrics.logical_width / @as(f32, @floatFromInt(window_w)) else 1.0;
+    const sy = if (window_h > 0) metrics.logical_height / @as(f32, @floatFromInt(window_h)) else 1.0;
+    return .{
+        .x = pt.x * sx,
+        .y = pt.y * sy,
     };
 }
 
@@ -198,6 +224,24 @@ pub fn textEditingFromUtf8(src: []const u8, start: i32, length: i32) Event {
         .start = start,
         .length = length,
     } };
+}
+
+/// 将任意长度的 UTF-8 文本按完整码点边界切分成一条或多条 `.text_input` 事件，
+/// 避免超长 IME 上屏或粘贴被 256 字节定长缓冲静默丢弃。
+pub fn appendTextInputChunks(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Event),
+    src: []const u8,
+) !void {
+    var rest = src;
+    while (rest.len > 0) {
+        var tb: TextBytes = .{};
+        const n = copyUtf8Bounded(&tb.utf8, rest);
+        if (n == 0) break;
+        tb.len = n;
+        try out.append(allocator, .{ .text_input = tb });
+        rest = rest[n..];
+    }
 }
 
 /// 把 `src` 拷进 `dst`，返回写入的字节数。只写入完整的 UTF-8 码点。
@@ -324,9 +368,9 @@ test "text events keep whole codepoints inside the fixed buffer" {
     try std.testing.expectEqual(@as(usize, 0), empty.text_input.len);
 }
 
-test "physical pixels come from SizeInPixels, not display scale" {
-    // SDL highdpi 文档里的 Windows 200%：窗口坐标已经是像素，display scale 是 2，像素密度是 1。
-    // 旧算法 logical * display_scale 会得到 7680，比真实交换链大一倍。
+test "physical pixels and logical normalization work across macOS and Windows 200%" {
+    // Windows 200%：SDL 窗口坐标是 3840x2160（已是像素），pixel_density=1，content_scale=2。
+    // 归一化后逻辑尺寸应为 1920x1080，交换链物理像素仍为权威的 3840x2160（绝不是 7680）。
     const windows = metricsFromPlatformSizes(.{
         .logical_width = 3840,
         .logical_height = 2160,
@@ -335,13 +379,15 @@ test "physical pixels come from SizeInPixels, not display scale" {
         .pixel_density = 1,
         .content_scale = 2,
     });
+    try std.testing.expectEqual(@as(f32, 1920), windows.logical_width);
+    try std.testing.expectEqual(@as(f32, 1080), windows.logical_height);
     try std.testing.expectEqual(@as(u32, 3840), windows.physicalWidth());
     try std.testing.expectEqual(@as(u32, 2160), windows.physicalHeight());
-    try std.testing.expectEqual(@as(f32, 1), windows.scale_factor);
-    try std.testing.expectEqual(@as(f32, 2), windows.content_scale);
-    const doubled = logicalToPhysicalPixels(windows.logical_width, windows.content_scale);
-    try std.testing.expectEqual(@as(u32, 7680), doubled);
-    try std.testing.expect(windows.physicalWidth() != doubled);
+    try std.testing.expectEqual(@as(f32, 2), windows.scale_factor);
+    try std.testing.expectEqual(@as(f32, 1), windows.pixel_density);
+    const win_mouse = windowPointToLogical(3840, 2160, windows, .{ .x = 1920, .y = 1080 });
+    try std.testing.expectEqual(@as(f32, 960), win_mouse.x);
+    try std.testing.expectEqual(@as(f32, 540), win_mouse.y);
 
     // macOS + HIGH_PIXEL_DENSITY：点坐标 1920x1080，像素 3840x2160，两个 scale 都是 2。
     const mac = metricsFromPlatformSizes(.{
@@ -352,10 +398,14 @@ test "physical pixels come from SizeInPixels, not display scale" {
         .pixel_density = 2,
         .content_scale = 2,
     });
+    try std.testing.expectEqual(@as(f32, 1920), mac.logical_width);
     try std.testing.expectEqual(@as(u32, 3840), mac.physicalWidth());
     try std.testing.expectEqual(@as(u32, 2160), mac.physicalHeight());
+    const mac_mouse = windowPointToLogical(1920, 1080, mac, .{ .x = 960, .y = 540 });
+    try std.testing.expectEqual(@as(f32, 960), mac_mouse.x);
+    try std.testing.expectEqual(@as(f32, 540), mac_mouse.y);
 
-    // 分数倍缩放下，round(logical * density) 和系统报的像素可以差 1。以 SizeInPixels 为准。
+    // 分数倍缩放下，交换链像素仍以 SizeInPixels 为准。
     const odd = metricsFromPlatformSizes(.{
         .logical_width = 801,
         .logical_height = 100,
@@ -386,6 +436,31 @@ test "physical pixels come from SizeInPixels, not display scale" {
     });
     try std.testing.expectEqual(@as(f32, 2), derived.scale_factor);
     try std.testing.expectEqual(@as(u32, 200), derived.physicalWidth());
+}
+
+test "appendTextInputChunks preserves full >256-byte Chinese and Emoji payload" {
+    const gpa = std.testing.allocator;
+    // 构造 90 个汉字 + 5 个 Emoji = 290 字节（大于单包 256 字节）
+    const unit = "你好世界测试文本😀";
+    var src: [unit.len * 11]u8 = undefined;
+    for (0..11) |k| {
+        @memcpy(src[k * unit.len ..][0..unit.len], unit);
+    }
+
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(gpa);
+
+    try appendTextInputChunks(gpa, &events, &src);
+    try std.testing.expect(events.items.len >= 2);
+
+    var reassembled: std.ArrayList(u8) = .empty;
+    defer reassembled.deinit(gpa);
+    for (events.items) |ev| {
+        const s = ev.text_input.slice();
+        try std.testing.expect(std.unicode.utf8ValidateSlice(s));
+        try reassembled.appendSlice(gpa, s);
+    }
+    try std.testing.expectEqualStrings(&src, reassembled.items);
 }
 
 test "mouse button codes match SDL_BUTTON values" {

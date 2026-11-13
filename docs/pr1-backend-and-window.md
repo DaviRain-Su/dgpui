@@ -60,14 +60,14 @@ README 原来写「100% 自己用 Zig 手写」。这个仓库是 AI 辅助实�
 ### (2) 不装 SDL 也能测
 `build.zig` 以前把头文件和库路径写死成 `/opt/homebrew`，`src/root.zig` 又无条件 `@import` SDL。结果 `zig build test` 在没有 Homebrew SDL 的 Linux 上编不过。现在按这个顺序找 SDL3：手动 `-Dsdl-include` / `-Dsdl-lib`、`pkg-config sdl3`、常见前缀（含 `/opt/homebrew`）。找不到时 headless 模块不导入 `sdl.zig`。`zig build test` 跑 headless 测试；本机有 SDL3 时同一条命令还会把桌面 demo 编译链接进去。`zig build test-headless` 永远不链接 SDL。配置阶段会把构建缓存标脏，避免装上或卸掉 SDL 之后还沿用上一次的探测结果。
 
-### (3) 物理像素不再乘 display scale
-SDL 的 high-DPI 说明把三件事分开了：窗口坐标（`SDL_GetWindowSize`）、可绘制像素（`SDL_GetWindowSizeInPixels`）、内容缩放（`SDL_GetWindowDisplayScale`）。像素密度是后两者之外的 `SDL_GetWindowPixelDensity`。macOS Retina 上 density 和 display scale 常常都是 2，旧公式碰巧正确。Windows 200% 上窗口坐标已经是像素，density 是 1，display scale 是 2，旧公式会把交换链算大一倍。`WindowMetrics.physicalWidth()` 现在优先返回 `SizeInPixels`。`PIXEL_SIZE_CHANGED` 本来就会重新查询，查询函数改对之后这条事件拿到的就是真实像素。
+### (3) 逻辑坐标系归一化与权威物理像素
+SDL 的 high-DPI 说明把三件事分开了：窗口坐标（`SDL_GetWindowSize`）、可绘制像素（`SDL_GetWindowSizeInPixels`）、内容缩放（`SDL_GetWindowDisplayScale`）。macOS 上窗口坐标本身就是逻辑点（point）；而 Windows / X11 开启 200% 缩放时，窗口坐标与鼠标输入坐标往往已经是物理像素，`content_scale` 为 `2.0`。因此 `metricsFromPlatformSizes` 在同时拿到 `SizeInPixels` 与 `content_scale` 时，统一用 `pixel / content_scale` 推导 `logical_width/height`，并用 `windowPointToLogical` 把鼠标坐标折算进同一逻辑空间；同时 `WindowMetrics.physicalWidth()` 优先直接返回 `SizeInPixels`（不靠乘法回推），避免分数倍缩放误差与双倍缓冲区 bug。
 
 ### (4) `resize` 记下像素尺寸，但不自己重建交换链
 SDL_GPU 没有 `resize(width, height)`。`SDL_SetGPUSwapchainParameters` 只改 composition 和 present mode。Vulkan 后端在 `SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED` 进入队列时把 `needsSwapchainRecreate` 设上，下一次 `SDL_WaitAndAcquireGPUSwapchainTexture` 才按那个事件里的像素重建。Metal 后端则在 acquire 时读 `CAMetalLayer.drawableSize`。所以 `resize` 不能是一声不吭的空函数：它把 `AppLoop` 传来的像素尺寸写进 `SdlBackend`，acquire 若带回非 0 的纹理尺寸再覆盖一次。交换链本身仍由 SDL 重建。
 
-### (5) 文本不再从码点中间截断，并接上 IME 预编辑
-SDL 的字符串只在这次取事件期间有效，所以要拷进 `Event` 自己的缓冲（`Event` 按值进队列）。缓冲从 32 字节加到 256 字节。更长的输入在 UTF-8 码点边界停下，不会把一个汉字或 emoji 切成两半。`SDL_StartTextInput` 的返回值现在会检查，失败走原来就声明了但没用到的 `TextInputStartFailed`。`SDL_EVENT_TEXT_EDITING` 译成 `text_editing`（组合串、光标起点、选区长度）。界面还不画它。候选词列表（`TEXT_EDITING_CANDIDATES`）这次没译。
+### (5) 文本按 UTF-8 码点边界完整拆分并接上 IME 预编辑
+SDL 的字符串只在这次取事件期间有效，所以要拷进 `Event` 自己的缓冲（`Event` 按值进队列）。单条事件缓冲为 256 字节，且 `copyUtf8Bounded` 只停在完整码点边界；当单次 `SDL_EVENT_TEXT_INPUT` 超过 256 字节（例如长段中文或粘贴）时，`appendTextInputChunks` 会按完整码点边界拆成多条 `.text_input` 放进 `SdlBackend.pending_events` 依次发出，既不破坏 UTF-8 也不丢弃后半段内容。`SDL_StartTextInput` 的返回值会检查，失败返回 `TextInputStartFailed`。`SDL_EVENT_TEXT_EDITING` 译成 `text_editing`（组合串、光标起点、选区长度）。界面还不画它。候选词列表（`TEXT_EDITING_CANDIDATES`）这次没译。
 
 ### (6) `damage_rect` 接上了，但仍然整屏清
 字段原来没有任何读取方。现在 `FrameParams.damage_rect` 会写到 Headless 的 `last_damage_rect` 和 SDL 后端的 `last_damage_rect`。`null` 表示整屏。SDL 的 load op 还是 `LOADOP_CLEAR`，没有 scissor。局部重绘留到 PR 2，代码和文档里都标了 `TODO(PR2)`。

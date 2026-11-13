@@ -37,6 +37,9 @@ pub const SdlBackend = struct {
     pixel_height: u32,
     /// TODO(PR2): 只记录，不参与裁剪。本帧仍然整屏 LOADOP_CLEAR。
     last_damage_rect: ?math.Rect,
+    /// 超长 TEXT_INPUT 拆分后的待派发事件队列
+    pending_events: std.ArrayList(platform.Event) = .empty,
+    pending_head: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, title: [*:0]const u8, width: i32, height: i32) !*SdlBackend {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
@@ -96,6 +99,7 @@ pub const SdlBackend = struct {
     }
 
     pub fn deinitSelf(self: *SdlBackend) void {
+        self.pending_events.deinit(self.allocator);
         if (self.cursor_arrow) |cur| c.SDL_DestroyCursor(cur);
         if (self.cursor_pointer) |cur| c.SDL_DestroyCursor(cur);
         if (self.cursor_text) |cur| c.SDL_DestroyCursor(cur);
@@ -142,6 +146,29 @@ pub const SdlBackend = struct {
         });
     }
 
+    fn windowToLogical(self: *const SdlBackend, wx: f32, wy: f32) math.Point {
+        var win_w: c_int = 0;
+        var win_h: c_int = 0;
+        if (!c.SDL_GetWindowSize(self.window, &win_w, &win_h)) {
+            win_w = 1;
+            win_h = 1;
+        }
+        return platform.windowPointToLogical(win_w, win_h, self.queryMetrics(), .{ .x = wx, .y = wy });
+    }
+
+    fn popPending(self: *SdlBackend) ?platform.Event {
+        if (self.pending_head >= self.pending_events.items.len) {
+            return null;
+        }
+        const ev = self.pending_events.items[self.pending_head];
+        self.pending_head += 1;
+        if (self.pending_head >= self.pending_events.items.len) {
+            self.pending_events.clearRetainingCapacity();
+            self.pending_head = 0;
+        }
+        return ev;
+    }
+
     fn translateSdlEvent(self: *SdlBackend, raw: *const c.SDL_Event) ?platform.Event {
         if (raw.type == self.redraw_event_type) {
             return .redraw_requested;
@@ -159,24 +186,24 @@ pub const SdlBackend = struct {
             },
             c.SDL_EVENT_WINDOW_EXPOSED => .redraw_requested,
             c.SDL_EVENT_MOUSE_MOTION => .{
-                .mouse_move = .{ .x = raw.motion.x, .y = raw.motion.y },
+                .mouse_move = self.windowToLogical(raw.motion.x, raw.motion.y),
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => .{
                 .mouse_down = .{
-                    .pos = .{ .x = raw.button.x, .y = raw.button.y },
+                    .pos = self.windowToLogical(raw.button.x, raw.button.y),
                     .button = translateButton(raw.button.button),
                     .clicks = raw.button.clicks,
                 },
             },
             c.SDL_EVENT_MOUSE_BUTTON_UP => .{
                 .mouse_up = .{
-                    .pos = .{ .x = raw.button.x, .y = raw.button.y },
+                    .pos = self.windowToLogical(raw.button.x, raw.button.y),
                     .button = translateButton(raw.button.button),
                 },
             },
             c.SDL_EVENT_MOUSE_WHEEL => .{
                 .scroll = .{
-                    .pos = .{ .x = raw.wheel.mouse_x, .y = raw.wheel.mouse_y },
+                    .pos = self.windowToLogical(raw.wheel.mouse_x, raw.wheel.mouse_y),
                     .dx = raw.wheel.x,
                     .dy = raw.wheel.y,
                 },
@@ -187,7 +214,17 @@ pub const SdlBackend = struct {
                     .repeat = raw.key.repeat,
                 },
             },
-            c.SDL_EVENT_TEXT_INPUT => platform.textInputFromUtf8(eventText(raw.text.text)),
+            c.SDL_EVENT_TEXT_INPUT => blk: {
+                const text = eventText(raw.text.text);
+                if (text.len == 0) break :blk null;
+                const start_idx = self.pending_events.items.len;
+                platform.appendTextInputChunks(self.allocator, &self.pending_events, text) catch {
+                    // OOM 回退：至少发出前 256 字节以内的完整码点
+                    break :blk platform.textInputFromUtf8(text);
+                };
+                if (self.pending_events.items.len == start_idx) break :blk null;
+                break :blk self.popPending();
+            },
             // 候选词列表（TEXT_EDITING_CANDIDATES）还没翻译，UI 也还不会画。
             c.SDL_EVENT_TEXT_EDITING => platform.textEditingFromUtf8(
                 eventText(raw.edit.text),
@@ -226,6 +263,7 @@ pub const SdlBackend = struct {
         .waitEvent = struct {
             fn call(ptr: *anyopaque) ?platform.Event {
                 const self: *SdlBackend = @ptrCast(@alignCast(ptr));
+                if (self.popPending()) |ev| return ev;
                 var raw: c.SDL_Event = undefined;
                 while (c.SDL_WaitEvent(&raw)) {
                     if (self.translateSdlEvent(&raw)) |ev| return ev;
@@ -236,6 +274,7 @@ pub const SdlBackend = struct {
         .pollEvent = struct {
             fn call(ptr: *anyopaque) ?platform.Event {
                 const self: *SdlBackend = @ptrCast(@alignCast(ptr));
+                if (self.popPending()) |ev| return ev;
                 var raw: c.SDL_Event = undefined;
                 while (c.SDL_PollEvent(&raw)) {
                     if (self.translateSdlEvent(&raw)) |ev| return ev;
