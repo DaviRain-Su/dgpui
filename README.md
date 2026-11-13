@@ -74,6 +74,7 @@
 ## 阅读导航
 
 - [架构拆解与通俗图解 (`docs/architecture.md`)](docs/architecture.md) —— 建议先花 5 分钟读这一篇，把所有名词一次对齐。
+- [GUI 框架大白话（`docs/gui-framework-plain.md`）](docs/gui-framework-plain.md) —— 面试前十分钟：五层各自干什么、代码做到哪、一帧怎么走。
 - [Rust GUI 框架面试映射表 (`docs/interview-map.md`)](docs/interview-map.md) —— 把 `dgpui` 的每一行代码翻译成 Rust / Slint / egui / Iced / 渲染管线面试术语。
 
 ---

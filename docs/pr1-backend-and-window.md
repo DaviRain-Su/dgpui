@@ -18,6 +18,8 @@
 - `src/backend/sdl.zig`：**桌面端后端**，用 `SDL3 + SDL_GPU`（在 macOS 自动跑 Metal）真正弹出原生窗口并完成 GPU 清屏。
 - `src/app.zig`：**主事件循环（`AppLoop`）**，实现“空闲休眠 + 队列排空 + 重绘合并”。
 
+面试前若要先用大白话把五层和这一层的边界讲顺，看 [gui-framework-plain.md](gui-framework-plain.md)。
+
 ---
 
 ## 3. 三个必须记住的核心机制
