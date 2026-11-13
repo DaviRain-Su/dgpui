@@ -12,6 +12,8 @@ const math = @import("../math.zig");
 const platform = @import("platform.zig");
 const renderer = @import("renderer.zig");
 
+pub const available = true;
+
 pub const SdlError = error{
     InitFailed,
     WindowCreateFailed,
@@ -29,6 +31,12 @@ pub const SdlBackend = struct {
     cursor_arrow: ?*c.SDL_Cursor,
     cursor_pointer: ?*c.SDL_Cursor,
     cursor_text: ?*c.SDL_Cursor,
+    /// 最近一次已知的交换链像素尺寸。来源是 `SDL_GetWindowSizeInPixels`，
+    /// 绘制时如果 acquire 带回了非 0 的纹理尺寸，会再用那个值覆盖。
+    pixel_width: u32,
+    pixel_height: u32,
+    /// TODO(PR2): 只记录，不参与裁剪。本帧仍然整屏 LOADOP_CLEAR。
+    last_damage_rect: ?math.Rect,
 
     pub fn init(allocator: std.mem.Allocator, title: [*:0]const u8, width: i32, height: i32) !*SdlBackend {
         if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
@@ -59,8 +67,12 @@ pub const SdlBackend = struct {
             std.log.err("SDL_ClaimWindowForGPUDevice failed: {s}", .{c.SDL_GetError()});
             return SdlError.ClaimWindowFailed;
         }
+        errdefer c.SDL_ReleaseWindowFromGPUDevice(gpu_device, window);
 
-        _ = c.SDL_StartTextInput(window);
+        if (!c.SDL_StartTextInput(window)) {
+            std.log.err("SDL_StartTextInput failed: {s}", .{c.SDL_GetError()});
+            return SdlError.TextInputStartFailed;
+        }
 
         const redraw_event_type = c.SDL_RegisterEvents(1);
 
@@ -73,7 +85,13 @@ pub const SdlBackend = struct {
             .cursor_arrow = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_DEFAULT),
             .cursor_pointer = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_POINTER),
             .cursor_text = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_TEXT),
+            .pixel_width = 1,
+            .pixel_height = 1,
+            .last_damage_rect = null,
         };
+        const metrics = self.queryMetrics();
+        self.pixel_width = metrics.physicalWidth();
+        self.pixel_height = metrics.physicalHeight();
         return self;
     }
 
@@ -103,16 +121,25 @@ pub const SdlBackend = struct {
     }
 
     fn queryMetrics(self: *const SdlBackend) platform.WindowMetrics {
-        var w: c_int = 0;
-        var h: c_int = 0;
-        _ = c.SDL_GetWindowSize(self.window, &w, &h);
-        var scale = c.SDL_GetWindowDisplayScale(self.window);
-        if (scale <= 0) scale = 1.0;
-        return .{
-            .logical_width = @floatFromInt(@max(1, w)),
-            .logical_height = @floatFromInt(@max(1, h)),
-            .scale_factor = scale,
-        };
+        var logical_w: c_int = 0;
+        var logical_h: c_int = 0;
+        if (!c.SDL_GetWindowSize(self.window, &logical_w, &logical_h)) {
+            logical_w = 1;
+            logical_h = 1;
+        }
+        var pixel_w: c_int = 0;
+        var pixel_h: c_int = 0;
+        const pixels_ok = c.SDL_GetWindowSizeInPixels(self.window, &pixel_w, &pixel_h);
+        // 物理像素用 SizeInPixels。scale_factor 用像素密度，不用 display scale。
+        // 见 platform.metricsFromPlatformSizes 的测试：Windows 200% 时两者不相等。
+        return platform.metricsFromPlatformSizes(.{
+            .logical_width = logical_w,
+            .logical_height = logical_h,
+            .pixel_width = if (pixels_ok) pixel_w else null,
+            .pixel_height = if (pixels_ok) pixel_h else null,
+            .pixel_density = c.SDL_GetWindowPixelDensity(self.window),
+            .content_scale = c.SDL_GetWindowDisplayScale(self.window),
+        });
     }
 
     fn translateSdlEvent(self: *SdlBackend, raw: *const c.SDL_Event) ?platform.Event {
@@ -121,6 +148,9 @@ pub const SdlBackend = struct {
         }
         return switch (raw.type) {
             c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => .quit,
+            // RESIZED 是窗口坐标变化。PIXEL_SIZE_CHANGED 是可绘制像素变化
+            // （跨屏、分数倍缩放时两者可以不同时发生）。两种都重新读 SizeInPixels。
+            // SDL_GPU 的 Vulkan 后端也是盯着 PIXEL_SIZE_CHANGED 重建交换链。
             c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => .{
                 .resized = self.queryMetrics(),
             },
@@ -157,29 +187,24 @@ pub const SdlBackend = struct {
                     .repeat = raw.key.repeat,
                 },
             },
-            c.SDL_EVENT_TEXT_INPUT => blk: {
-                const cstr: [*:0]const u8 = raw.text.text orelse break :blk null;
-                const slice = std.mem.span(cstr);
-                var ev_text: @FieldType(platform.Event, "text_input") = .{
-                    .utf8 = @splat(0),
-                    .len = 0,
-                };
-                const copy_len = @min(slice.len, ev_text.utf8.len);
-                @memcpy(ev_text.utf8[0..copy_len], slice[0..copy_len]);
-                ev_text.len = @intCast(copy_len);
-                break :blk .{ .text_input = ev_text };
-            },
+            c.SDL_EVENT_TEXT_INPUT => platform.textInputFromUtf8(eventText(raw.text.text)),
+            // 候选词列表（TEXT_EDITING_CANDIDATES）还没翻译，UI 也还不会画。
+            c.SDL_EVENT_TEXT_EDITING => platform.textEditingFromUtf8(
+                eventText(raw.edit.text),
+                raw.edit.start,
+                raw.edit.length,
+            ),
             else => null,
         };
     }
 
+    fn eventText(ptr: [*c]const u8) []const u8 {
+        const cstr = ptr orelse return "";
+        return std.mem.span(cstr);
+    }
+
     fn translateButton(btn: u8) platform.MouseButton {
-        return switch (btn) {
-            c.SDL_BUTTON_LEFT => .left,
-            c.SDL_BUTTON_MIDDLE => .middle,
-            c.SDL_BUTTON_RIGHT => .right,
-            else => .other,
-        };
+        return platform.mouseButtonFromCode(btn);
     }
 
     fn translateKey(key: c.SDL_Keycode) platform.KeyCode {
@@ -259,6 +284,8 @@ pub const SdlBackend = struct {
         .renderFrame = struct {
             fn call(ptr: *anyopaque, params: renderer.FrameParams) anyerror!void {
                 const self: *SdlBackend = @ptrCast(@alignCast(ptr));
+                // TODO(PR2): 局部重绘。这里把脏区记下来，下面的 load op 仍然是整屏 CLEAR。
+                self.last_damage_rect = params.damage_rect;
                 const cmd_buf = c.SDL_AcquireGPUCommandBuffer(self.gpu_device) orelse {
                     return SdlError.CommandBufferFailed;
                 };
@@ -276,6 +303,9 @@ pub const SdlBackend = struct {
                     _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
                     return;
                 }
+
+                if (w != 0) self.pixel_width = w;
+                if (h != 0) self.pixel_height = h;
 
                 if (swapchain_tex) |tex| {
                     var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
@@ -299,8 +329,18 @@ pub const SdlBackend = struct {
             }
         }.call,
         .resize = struct {
-            fn call(_: *anyopaque, _: u32, _: u32) void {
-                // SDL_GPU 会在 WaitAndAcquireGPUSwapchainTexture 时自动适配窗口像素大小
+            fn call(ptr: *anyopaque, physical_width: u32, physical_height: u32) void {
+                const self: *SdlBackend = @ptrCast(@alignCast(ptr));
+                // 不在这里重建交换链。SDL_GPU 没有按宽高重建的公开 API：
+                // `SDL_SetGPUSwapchainParameters` 只改 composition / present mode。
+                // Vulkan 后端在事件进入队列时看到 PIXEL_SIZE_CHANGED，把
+                // needsSwapchainRecreate 设上，下一次 WaitAndAcquire 才真正重建，
+                // 尺寸来自那个事件里的像素（也就是 SizeInPixels）。
+                // Metal 后端则在 acquire 时读 layer.drawableSize。
+                // 我们要做的是把 AppLoop 算好的像素尺寸留在后端状态里，
+                // acquire 回来的纹理尺寸会再覆盖一次（见 renderFrame）。
+                self.pixel_width = @max(physical_width, 1);
+                self.pixel_height = @max(physical_height, 1);
             }
         }.call,
         .deinit = struct {

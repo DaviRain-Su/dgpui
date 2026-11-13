@@ -21,6 +21,9 @@ pub const HeadlessBackend = struct {
     redraw_requests: usize = 0,
     rendered_frames: usize = 0,
     last_frame_params: ?renderer.FrameParams = null,
+    /// `FrameParams.damage_rect` 的镜像。null 表示调用方要求整屏。
+    /// TODO(PR2): 局部重绘还没做，这个字段只用来证明渲染接口把脏区接住了。
+    last_damage_rect: ?math.Rect = null,
     current_cursor: platform.CursorShape = .arrow,
     last_resize_physical: ?struct { w: u32, h: u32 } = null,
 
@@ -62,7 +65,7 @@ pub const HeadlessBackend = struct {
         switch (ev) {
             .resized => |m| self.window_metrics = m,
             .scale_changed => |m| self.window_metrics = m,
-            else => {},
+            .quit, .redraw_requested, .mouse_move, .mouse_down, .mouse_up, .scroll, .key_down, .text_input, .text_editing => {},
         }
         return ev;
     }
@@ -113,6 +116,7 @@ pub const HeadlessBackend = struct {
                 const self: *HeadlessBackend = @ptrCast(@alignCast(ptr));
                 self.rendered_frames += 1;
                 self.last_frame_params = params;
+                self.last_damage_rect = params.damage_rect;
             }
         }.call,
         .resize = struct {
@@ -152,4 +156,15 @@ test "headless backend records events and rendered frames" {
         .clear_color = math.Color.fromHex(0x1e1e2e),
     });
     try std.testing.expectEqual(@as(usize, 1), hb.rendered_frames);
+    try std.testing.expectEqual(@as(?math.Rect, null), hb.last_damage_rect);
+
+    const damage = math.Rect.init(4, 5, 6, 7);
+    try rb.renderFrame(.{
+        .logical_size = pb.metrics().logicalSize(),
+        .scale_factor = pb.metrics().scale_factor,
+        .clear_color = math.Color.fromHex(0x1e1e2e),
+        .damage_rect = damage,
+    });
+    try std.testing.expectEqual(@as(usize, 2), hb.rendered_frames);
+    try std.testing.expectEqual(damage, hb.last_damage_rect.?);
 }

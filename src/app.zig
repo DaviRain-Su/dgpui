@@ -10,6 +10,7 @@ const std = @import("std");
 const math = @import("math.zig");
 const platform = @import("backend/platform.zig");
 const renderer = @import("backend/renderer.zig");
+const HeadlessBackend = @import("backend/headless.zig").HeadlessBackend;
 
 pub const AppCallbacks = struct {
     ctx: *anyopaque,
@@ -87,7 +88,8 @@ pub const AppLoop = struct {
             .redraw_requested => {
                 self.needs_redraw = true;
             },
-            else => {},
+            // 输入事件留给回调。text_editing 只是翻译进了平台事件，循环本身还不画 IME。
+            .mouse_move, .mouse_down, .mouse_up, .scroll, .key_down, .text_input, .text_editing => {},
         }
 
         if (self.callbacks) |cb| {
@@ -104,14 +106,14 @@ pub const AppLoop = struct {
             .logical_size = m.logicalSize(),
             .scale_factor = m.scale_factor,
             .clear_color = self.clear_color,
+            // TODO(PR2): 这里还不会算脏区并集。null = 整屏。字段已经接到渲染后端，只是还不用来裁剪。
+            .damage_rect = null,
         });
     }
 };
 
 test "event loop sleeps on idle and coalesces multiple redraw requests into 1 frame" {
-    const Headless = @import("backend/headless.zig").HeadlessBackend;
-
-    var hb = Headless.init(std.testing.allocator, .{
+    var hb = HeadlessBackend.init(std.testing.allocator, .{
         .logical_width = 400,
         .logical_height = 300,
         .scale_factor = 2.0,
@@ -139,4 +141,31 @@ test "event loop sleeps on idle and coalesces multiple redraw requests into 1 fr
     try std.testing.expectEqual(@as(usize, 2), hb.wait_calls);
     try std.testing.expectEqual(@as(u32, 1200), hb.last_resize_physical.?.w);
     try std.testing.expectEqual(@as(u32, 800), hb.last_resize_physical.?.h);
+    // 主循环还没算脏区，传给渲染器的 damage_rect 保持 null（整屏）。
+    try std.testing.expectEqual(@as(?math.Rect, null), hb.last_damage_rect);
+}
+
+test "resize reports explicit pixel size instead of logical times content scale" {
+    var hb = HeadlessBackend.init(std.testing.allocator, .{
+        .logical_width = 800,
+        .logical_height = 600,
+        .scale_factor = 1,
+    });
+    defer hb.deinitSelf();
+
+    // Windows 200% 那种数字：逻辑尺寸已经等于像素，content_scale 是 2，不能再乘一次。
+    try hb.pushEvent(.{ .resized = .{
+        .logical_width = 3840,
+        .logical_height = 2160,
+        .scale_factor = 1,
+        .content_scale = 2,
+        .pixel_width = 3840,
+        .pixel_height = 2160,
+    } });
+
+    var loop = AppLoop.init(hb.platformBackend(), hb.rendererBackend());
+    try loop.run();
+
+    try std.testing.expectEqual(@as(u32, 3840), hb.last_resize_physical.?.w);
+    try std.testing.expectEqual(@as(u32, 2160), hb.last_resize_physical.?.h);
 }
