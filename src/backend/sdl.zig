@@ -9,10 +9,20 @@
 const std = @import("std");
 const c = @import("c");
 const math = @import("../math.zig");
+const scene = @import("../scene.zig");
 const platform = @import("platform.zig");
 const renderer = @import("renderer.zig");
 
 pub const available = true;
+
+const quad_shader_source = @embedFile("../shader/quad.metal");
+
+const FrameUniforms = extern struct {
+    viewport_w: f32,
+    viewport_h: f32,
+    scale_factor: f32,
+    base_instance: u32,
+};
 
 pub const SdlError = error{
     InitFailed,
@@ -20,6 +30,9 @@ pub const SdlError = error{
     GpuDeviceCreateFailed,
     ClaimWindowFailed,
     TextInputStartFailed,
+    ShaderCreateFailed,
+    PipelineCreateFailed,
+    BufferCreateFailed,
     CommandBufferFailed,
 };
 
@@ -27,6 +40,10 @@ pub const SdlBackend = struct {
     allocator: std.mem.Allocator,
     window: *c.SDL_Window,
     gpu_device: *c.SDL_GPUDevice,
+    quad_pipeline: *c.SDL_GPUGraphicsPipeline,
+    quad_buffer: ?*c.SDL_GPUBuffer = null,
+    quad_transfer_buffer: ?*c.SDL_GPUTransferBuffer = null,
+    quad_buffer_capacity: usize = 0,
     redraw_event_type: u32,
     cursor_arrow: ?*c.SDL_Cursor,
     cursor_pointer: ?*c.SDL_Cursor,
@@ -41,7 +58,7 @@ pub const SdlBackend = struct {
     cached_metrics: platform.WindowMetrics,
     cached_window_w: i32,
     cached_window_h: i32,
-    /// TODO(PR2): 只记录，不参与裁剪。本帧仍然整屏 LOADOP_CLEAR。
+    /// 记录最近一帧传入的脏区，用于与批裁剪区求交设置物理 Scissor
     last_damage_rect: ?math.Rect,
     /// 超长 TEXT_INPUT 拆分后的待派发事件队列
     pending_events: std.ArrayList(platform.Event) = .empty,
@@ -87,6 +104,9 @@ pub const SdlBackend = struct {
             return SdlError.TextInputStartFailed;
         }
 
+        const quad_pipeline = try createQuadPipeline(gpu_device, window);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(gpu_device, quad_pipeline);
+
         const redraw_event_type = c.SDL_RegisterEvents(1);
 
         const self = try allocator.create(SdlBackend);
@@ -94,6 +114,7 @@ pub const SdlBackend = struct {
             .allocator = allocator,
             .window = window,
             .gpu_device = gpu_device,
+            .quad_pipeline = quad_pipeline,
             .redraw_event_type = redraw_event_type,
             .cursor_arrow = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_DEFAULT),
             .cursor_pointer = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_POINTER),
@@ -113,8 +134,99 @@ pub const SdlBackend = struct {
         return self;
     }
 
+    fn createQuadPipeline(gpu_device: *c.SDL_GPUDevice, window: *c.SDL_Window) !*c.SDL_GPUGraphicsPipeline {
+        var vs_info = std.mem.zeroes(c.SDL_GPUShaderCreateInfo);
+        vs_info.code = quad_shader_source.ptr;
+        vs_info.code_size = quad_shader_source.len;
+        vs_info.entrypoint = "quad_vs";
+        vs_info.format = c.SDL_GPU_SHADERFORMAT_MSL;
+        vs_info.stage = c.SDL_GPU_SHADERSTAGE_VERTEX;
+        vs_info.num_uniform_buffers = 1;
+        vs_info.num_storage_buffers = 1;
+
+        const vs = c.SDL_CreateGPUShader(gpu_device, &vs_info) orelse {
+            std.log.err("SDL_CreateGPUShader (quad_vs) failed: {s}", .{c.SDL_GetError()});
+            return SdlError.ShaderCreateFailed;
+        };
+        defer c.SDL_ReleaseGPUShader(gpu_device, vs);
+
+        var fs_info = std.mem.zeroes(c.SDL_GPUShaderCreateInfo);
+        fs_info.code = quad_shader_source.ptr;
+        fs_info.code_size = quad_shader_source.len;
+        fs_info.entrypoint = "quad_fs";
+        fs_info.format = c.SDL_GPU_SHADERFORMAT_MSL;
+        fs_info.stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT;
+
+        const fs = c.SDL_CreateGPUShader(gpu_device, &fs_info) orelse {
+            std.log.err("SDL_CreateGPUShader (quad_fs) failed: {s}", .{c.SDL_GetError()});
+            return SdlError.ShaderCreateFailed;
+        };
+        defer c.SDL_ReleaseGPUShader(gpu_device, fs);
+
+        var color_target = std.mem.zeroes(c.SDL_GPUColorTargetDescription);
+        color_target.format = c.SDL_GetGPUSwapchainTextureFormat(gpu_device, window);
+        color_target.blend_state = .{
+            .enable_blend = true,
+            .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+            .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .color_blend_op = c.SDL_GPU_BLENDOP_ADD,
+            .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
+            .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
+            .color_write_mask = 0,
+            .enable_color_write_mask = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        };
+
+        var pipe_info = std.mem.zeroes(c.SDL_GPUGraphicsPipelineCreateInfo);
+        pipe_info.vertex_shader = vs;
+        pipe_info.fragment_shader = fs;
+        pipe_info.primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        pipe_info.rasterizer_state.fill_mode = c.SDL_GPU_FILLMODE_FILL;
+        pipe_info.rasterizer_state.cull_mode = c.SDL_GPU_CULLMODE_NONE;
+        pipe_info.rasterizer_state.front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+        pipe_info.target_info.color_target_descriptions = &color_target;
+        pipe_info.target_info.num_color_targets = 1;
+
+        return c.SDL_CreateGPUGraphicsPipeline(gpu_device, &pipe_info) orelse {
+            std.log.err("SDL_CreateGPUGraphicsPipeline failed: {s}", .{c.SDL_GetError()});
+            return SdlError.PipelineCreateFailed;
+        };
+    }
+
+    fn ensureQuadBuffers(self: *SdlBackend, required_instances: usize) !void {
+        if (required_instances <= self.quad_buffer_capacity and self.quad_buffer != null and self.quad_transfer_buffer != null) {
+            return;
+        }
+        const new_cap = @max(required_instances, @max(self.quad_buffer_capacity * 2, 256));
+        const byte_size: u32 = @intCast(new_cap * @sizeOf(scene.QuadInstance));
+
+        const new_buf = c.SDL_CreateGPUBuffer(self.gpu_device, &.{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = byte_size,
+            .props = 0,
+        }) orelse return SdlError.BufferCreateFailed;
+        errdefer c.SDL_ReleaseGPUBuffer(self.gpu_device, new_buf);
+
+        const new_tx = c.SDL_CreateGPUTransferBuffer(self.gpu_device, &.{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = byte_size,
+            .props = 0,
+        }) orelse return SdlError.BufferCreateFailed;
+
+        if (self.quad_buffer) |old| c.SDL_ReleaseGPUBuffer(self.gpu_device, old);
+        if (self.quad_transfer_buffer) |old| c.SDL_ReleaseGPUTransferBuffer(self.gpu_device, old);
+        self.quad_buffer = new_buf;
+        self.quad_transfer_buffer = new_tx;
+        self.quad_buffer_capacity = new_cap;
+    }
+
     pub fn deinitSelf(self: *SdlBackend) void {
         self.pending_events.deinit(self.allocator);
+        if (self.quad_transfer_buffer) |tx| c.SDL_ReleaseGPUTransferBuffer(self.gpu_device, tx);
+        if (self.quad_buffer) |buf| c.SDL_ReleaseGPUBuffer(self.gpu_device, buf);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.gpu_device, self.quad_pipeline);
         if (self.cursor_arrow) |cur| c.SDL_DestroyCursor(cur);
         if (self.cursor_pointer) |cur| c.SDL_DestroyCursor(cur);
         if (self.cursor_text) |cur| c.SDL_DestroyCursor(cur);
@@ -391,8 +503,17 @@ pub const SdlBackend = struct {
         .renderFrame = struct {
             fn call(ptr: *anyopaque, params: renderer.FrameParams) anyerror!void {
                 const self: *SdlBackend = @ptrCast(@alignCast(ptr));
-                // TODO(PR2): 局部重绘。这里把脏区记下来，下面的 load op 仍然是整屏 CLEAR。
                 self.last_damage_rect = params.damage_rect;
+
+                var built: ?scene.BuiltBatches = null;
+                defer if (built) |*b| b.deinit(self.allocator);
+                if (params.display_list) |dl| {
+                    built = try dl.buildBatches(self.allocator);
+                    if (built.?.instances.len > 0) {
+                        try self.ensureQuadBuffers(built.?.instances.len);
+                    }
+                }
+
                 const cmd_buf = c.SDL_AcquireGPUCommandBuffer(self.gpu_device) orelse {
                     return SdlError.CommandBufferFailed;
                 };
@@ -415,6 +536,30 @@ pub const SdlBackend = struct {
                 if (h != 0) self.pixel_height = h;
 
                 if (swapchain_tex) |tex| {
+                    // 1. 一次整块上传所有 QuadInstance 到 GPU Storage Buffer
+                    if (built) |b| {
+                        if (b.instances.len > 0) {
+                            const tx = self.quad_transfer_buffer.?;
+                            if (c.SDL_MapGPUTransferBuffer(self.gpu_device, tx, true)) |mapped| {
+                                const dst: [*]scene.QuadInstance = @ptrCast(@alignCast(mapped));
+                                @memcpy(dst[0..b.instances.len], b.instances);
+                                c.SDL_UnmapGPUTransferBuffer(self.gpu_device, tx);
+
+                                if (c.SDL_BeginGPUCopyPass(cmd_buf)) |copy_pass| {
+                                    const byte_len: u32 = @intCast(b.instances.len * @sizeOf(scene.QuadInstance));
+                                    c.SDL_UploadToGPUBuffer(
+                                        copy_pass,
+                                        &.{ .transfer_buffer = tx, .offset = 0 },
+                                        &.{ .buffer = self.quad_buffer.?, .offset = 0, .size = byte_len },
+                                        true,
+                                    );
+                                    c.SDL_EndGPUCopyPass(copy_pass);
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. 开启 RenderPass：清屏并逐批按 Scissor 绘制 Instanced SDF Quad
                     var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
                     color_target.texture = tex;
                     color_target.clear_color = .{
@@ -423,11 +568,65 @@ pub const SdlBackend = struct {
                         .b = params.clear_color.b,
                         .a = params.clear_color.a,
                     };
+                    // macOS Metal 交换链采用多帧环形缓冲，每帧取到的可能是上一两帧旧纹理，
+                    // 因此整帧保持 CLEAR，通过下方 SDL_SetGPUScissor 与批裁剪控制片元范围。
                     color_target.load_op = c.SDL_GPU_LOADOP_CLEAR;
                     color_target.store_op = c.SDL_GPU_STOREOP_STORE;
 
                     const pass = c.SDL_BeginGPURenderPass(cmd_buf, &color_target, 1, null);
                     if (pass) |p| {
+                        if (built) |b| {
+                            if (b.instances.len > 0 and self.quad_buffer != null) {
+                                const fb_w = if (w != 0) w else self.pixel_width;
+                                const fb_h = if (h != 0) h else self.pixel_height;
+
+                                c.SDL_BindGPUGraphicsPipeline(p, self.quad_pipeline);
+                                const storage_bufs = [_]?*c.SDL_GPUBuffer{self.quad_buffer};
+                                c.SDL_BindGPUVertexStorageBuffers(p, 0, &storage_bufs, 1);
+
+                                const full_scissor = c.SDL_Rect{
+                                    .x = 0,
+                                    .y = 0,
+                                    .w = @intCast(fb_w),
+                                    .h = @intCast(fb_h),
+                                };
+
+                                for (b.batches) |batch| {
+                                    // 注意：因为上面 Swapchain 使用了 LOADOP_CLEAR（整帧清屏），
+                                    // 这里只能按批自身的 clip_rect 裁剪，绝不能再叠加 params.damage_rect，
+                                    // 否则静态未变化的元素在清屏后会被 Scissor 挡住而消失。
+                                    // （真正的局部增量绘制需要离屏持久 RenderTarget 或 LOADOP_LOAD 单缓冲。）
+                                    const maybe_sc = scene.computePhysicalScissor(
+                                        batch.clip_rect,
+                                        null,
+                                        params.logical_size,
+                                        fb_w,
+                                        fb_h,
+                                    );
+                                    if (maybe_sc) |sc| {
+                                        if (sc.isEmpty()) continue;
+                                        const sdl_sc = c.SDL_Rect{
+                                            .x = sc.x,
+                                            .y = sc.y,
+                                            .w = sc.w,
+                                            .h = sc.h,
+                                        };
+                                        c.SDL_SetGPUScissor(p, &sdl_sc);
+                                    } else {
+                                        c.SDL_SetGPUScissor(p, &full_scissor);
+                                    }
+
+                                    const uniforms = FrameUniforms{
+                                        .viewport_w = params.logical_size.width,
+                                        .viewport_h = params.logical_size.height,
+                                        .scale_factor = params.scale_factor,
+                                        .base_instance = batch.instance_start,
+                                    };
+                                    c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &uniforms, @sizeOf(FrameUniforms));
+                                    c.SDL_DrawGPUPrimitives(p, 6, batch.instance_count, 0, 0);
+                                }
+                            }
+                        }
                         c.SDL_EndGPURenderPass(p);
                     }
                 }

@@ -6,13 +6,17 @@
 //! 这和 Slint 支持 FemtoVG / Skia / Software 多渲染后端是同一个架构思路。
 
 const math = @import("../math.zig");
+const scene = @import("../scene.zig");
 
 pub const FrameParams = struct {
     logical_size: math.Size,
     scale_factor: f32,
     clear_color: math.Color,
+    /// 可选的绘制清单（与 GPU 无关的中间层）；为空时只做清屏
+    display_list: ?*const scene.DisplayList = null,
     /// 脏区（逻辑像素）。null 表示整屏。
-    /// TODO(PR2): 局部重绘还没做。渲染后端要记下这个值，但本 PR 仍然整屏 clear，不按它做 scissor。
+    /// Headless 后端会记录该值供断言；桌面 Swapchain 使用 LOADOP_CLEAR 时只按批裁剪区做 Scissor，
+    /// 未来接入离屏持久画布（LOADOP_LOAD）时可直接复用 `scene.computePhysicalScissor` 做脏区局部重绘。
     damage_rect: ?math.Rect = null,
 };
 
