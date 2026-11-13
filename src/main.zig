@@ -1,11 +1,58 @@
 const std = @import("std");
 const dgpui = @import("dgpui");
 
-pub fn main(init: std.process.Init) !void {
-    _ = init;
-    std.debug.print("dgpui {s} — 骨架已就绪，准备进入 PR 1！\n", .{dgpui.version});
-}
+const DemoState = struct {
+    clicks: usize = 0,
 
-test "main module sanity check" {
-    try std.testing.expect(dgpui.version.len > 0);
+    fn onEvent(ctx: *anyopaque, ev: dgpui.backend.platform.Event, loop: *dgpui.app.AppLoop) void {
+        const self: *DemoState = @ptrCast(@alignCast(ctx));
+        switch (ev) {
+            .mouse_down => |md| {
+                self.clicks += 1;
+                // 演示用：每次点击换一个背景色调，证明事件确实唤醒了循环并触发了 Metal 重绘
+                const palette = [_]u24{ 0x1e1e2e, 0x181825, 0x1e293b, 0x2a1e2e };
+                loop.clear_color = dgpui.math.Color.fromHex(palette[self.clicks % palette.len]);
+                loop.requestRedraw();
+                std.log.info("mouse_down at ({d:.1}, {d:.1}), clicks={d}", .{ md.pos.x, md.pos.y, self.clicks });
+            },
+            .resized => |m| {
+                std.log.info("window resized: logical={d:.0}x{d:.0} scale={d:.1} physical={d}x{d}", .{
+                    m.logical_width,
+                    m.logical_height,
+                    m.scale_factor,
+                    m.physicalWidth(),
+                    m.physicalHeight(),
+                });
+            },
+            .key_down => |kd| {
+                if (kd.key == .escape) loop.quit();
+            },
+            else => {},
+        }
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+
+    const sdl = try dgpui.backend.sdl.SdlBackend.init(gpa, "dgpui — PR 1: Backend & Event Loop", 800, 600);
+    defer sdl.deinitSelf();
+
+    const m = sdl.platformBackend().metrics();
+    std.log.info("PR 1 ready: logical={d:.0}x{d:.0}, scale={d:.1}, physical={d}x{d}", .{
+        m.logical_width,
+        m.logical_height,
+        m.scale_factor,
+        m.physicalWidth(),
+        m.physicalHeight(),
+    });
+
+    var state = DemoState{};
+    var loop = dgpui.app.AppLoop.init(sdl.platformBackend(), sdl.rendererBackend());
+    loop.callbacks = .{
+        .ctx = &state,
+        .onEvent = DemoState.onEvent,
+    };
+
+    try loop.run();
 }
