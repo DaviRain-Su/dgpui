@@ -86,7 +86,8 @@ pub const PlatformSizeQuery = struct {
     pixel_height: ?i32 = null,
     /// `<= 0` 表示 `SDL_GetWindowPixelDensity` 失败。有像素尺寸时用像素 / 逻辑尺寸估算。
     pixel_density: f32 = 0,
-    /// `<= 0` 表示 `SDL_GetWindowDisplayScale` 失败，记成 1。不参与物理像素计算。
+    /// `<= 0` 表示 `SDL_GetWindowDisplayScale` 失败，这时退回像素密度。
+    /// 有权威像素时，逻辑尺寸是 `pixel / content_scale`。物理像素仍以 `SizeInPixels` 为准。
     content_scale: f32 = 0,
 };
 
@@ -137,6 +138,44 @@ pub fn windowPointToLogical(window_w: i32, window_h: i32, metrics: WindowMetrics
         .x = pt.x * sx,
         .y = pt.y * sy,
     };
+}
+
+pub const WindowCoordSize = struct {
+    w: i32,
+    h: i32,
+};
+
+/// 把「调用方要的逻辑尺寸」换回 `SDL_CreateWindow` 使用的窗口坐标。
+/// macOS 上窗口坐标已经等于逻辑尺寸，结果不变。
+/// Windows/X11 200% 上窗口坐标是像素，第一次按 800×600 建出来逻辑只有 400×300，
+/// 这里返回 1600×1200，让 `pixel / content_scale` 重新等于请求值。
+pub fn windowSizeForRequestedLogical(
+    requested_w: i32,
+    requested_h: i32,
+    window_w: i32,
+    window_h: i32,
+    logical_w: f32,
+    logical_h: f32,
+) WindowCoordSize {
+    const req_w: f32 = @floatFromInt(@max(requested_w, 1));
+    const req_h: f32 = @floatFromInt(@max(requested_h, 1));
+    const win_w: f32 = @floatFromInt(@max(window_w, 1));
+    const win_h: f32 = @floatFromInt(@max(window_h, 1));
+    const log_w = if (logical_w > 0 and std.math.isFinite(logical_w)) logical_w else 1;
+    const log_h = if (logical_h > 0 and std.math.isFinite(logical_h)) logical_h else 1;
+    if (@abs(log_w - req_w) < 0.5 and @abs(log_h - req_h) < 0.5) {
+        return .{ .w = @max(window_w, 1), .h = @max(window_h, 1) };
+    }
+    return .{
+        .w = roundToWindowCoord(req_w * win_w / log_w),
+        .h = roundToWindowCoord(req_h * win_h / log_h),
+    };
+}
+
+fn roundToWindowCoord(v: f32) i32 {
+    if (!std.math.isFinite(v) or v <= 1) return 1;
+    const max_i: f32 = @floatFromInt(std.math.maxInt(i32));
+    return @intFromFloat(@round(@min(v, max_i)));
 }
 
 fn positivePixel(v: ?i32) ?u32 {
@@ -196,8 +235,11 @@ pub const Event = union(enum) {
 };
 
 /// 文本事件的定长缓冲。`Event` 按值进队列，所以不能持有 SDL 的指针。
-/// 超长时在码点边界截断，避免把一个汉字或 emoji 切成非法 UTF-8。
+/// 单条事件放不下时，`TEXT_INPUT` 会按码点拆成多条；非法 UTF-8 换成 U+FFFD 后继续。
 pub const text_byte_cap = 256;
+
+/// UTF-8 替换字符。非法或半截序列写成它，而不是把后面的字节丢掉。
+pub const utf8_replacement = "\u{FFFD}";
 
 pub const TextBytes = struct {
     utf8: [text_byte_cap]u8 = @splat(0),
@@ -209,7 +251,7 @@ pub const TextBytes = struct {
 
     pub fn fromUtf8(src: []const u8) TextBytes {
         var out: TextBytes = .{};
-        out.len = copyUtf8Bounded(&out.utf8, src);
+        out.len = copyUtf8Bounded(&out.utf8, src).written;
         return out;
     }
 };
@@ -226,9 +268,9 @@ pub fn textEditingFromUtf8(src: []const u8, start: i32, length: i32) Event {
     } };
 }
 
-/// 将任意长度的 UTF-8 文本按完整码点边界切分成一条或多条 `.text_input` 事件，
-/// 避免超长 IME 上屏或粘贴被 256 字节定长缓冲静默丢弃。
-/// 若中途分配失败，自动回滚到调用前的长度，保持原子性。
+/// 将任意长度的 UTF-8 文本按完整码点边界切分成一条或多条 `.text_input` 事件。
+/// 非法字节换成 U+FFFD 后继续，不把后半段丢掉。
+/// 分配失败时回滚到调用前的长度，一条残缺分片都不留。
 pub fn appendTextInputChunks(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(Event),
@@ -240,27 +282,77 @@ pub fn appendTextInputChunks(
     var rest = src;
     while (rest.len > 0) {
         var tb: TextBytes = .{};
-        const n = copyUtf8Bounded(&tb.utf8, rest);
-        if (n == 0) break;
-        tb.len = n;
+        const copied = copyUtf8Bounded(&tb.utf8, rest);
+        if (copied.consumed == 0) return error.NoSpaceLeft;
+        tb.len = copied.written;
         try out.append(allocator, .{ .text_input = tb });
-        rest = rest[n..];
+        rest = rest[copied.consumed..];
     }
 }
 
-/// 把 `src` 拷进 `dst`，返回写入的字节数。只写入完整的 UTF-8 码点。
-/// 源字符串在码点中间断开、或第一个字节就不是合法起始字节时，停在最后一个完整码点。
-pub fn copyUtf8Bounded(dst: []u8, src: []const u8) usize {
-    var i: usize = 0;
-    while (i < src.len and i < dst.len) {
-        const seq_len_u3 = std.unicode.utf8ByteSequenceLength(src[i]) catch break;
+/// `queueTextInputChunks` 的结果。SDL 后端只根据它决定发队列还是发截断前缀。
+pub const QueuedTextInput = union(enum) {
+    /// 全部分片已经追加进 `out`。
+    queued,
+    /// 分配失败，`out` 已回滚。`prefix` 是不分配内存就能发出的第一段（最多 256 字节），其余放弃。
+    oom_prefix: Event,
+};
+
+/// SDL 文本输入的完整路径，不依赖 SDL。
+/// 成功时分片在 `out` 里；失败时只给出第一段前缀，调用方必须打日志，不能假装没丢。
+pub fn queueTextInputChunks(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Event),
+    src: []const u8,
+) QueuedTextInput {
+    appendTextInputChunks(allocator, out, src) catch {
+        return .{ .oom_prefix = textInputFromUtf8(src) };
+    };
+    return .queued;
+}
+
+pub const Utf8Copy = struct {
+    written: usize,
+    consumed: usize,
+};
+
+/// 把 `src` 拷进 `dst`。
+/// 合法码点原样写入。非法起始字节、校验失败的序列、以及 src 末尾的半截序列，
+/// 写成一个 U+FFFD 再继续。放不下下一个码点或替换字符时停住，且不消费这段，
+/// 让调用方换一块空缓冲接着写。
+pub fn copyUtf8Bounded(dst: []u8, src: []const u8) Utf8Copy {
+    var written: usize = 0;
+    var consumed: usize = 0;
+    while (consumed < src.len) {
+        const seq_len_u3 = std.unicode.utf8ByteSequenceLength(src[consumed]) catch {
+            if (!writeUtf8Replacement(dst, &written)) break;
+            consumed += 1;
+            continue;
+        };
         const seq_len: usize = seq_len_u3;
-        if (seq_len == 0 or i + seq_len > src.len or i + seq_len > dst.len) break;
-        if (!utf8SequenceValid(src[i..][0..seq_len])) break;
-        i += seq_len;
+        if (consumed + seq_len > src.len) {
+            if (!writeUtf8Replacement(dst, &written)) break;
+            consumed = src.len;
+            break;
+        }
+        if (!utf8SequenceValid(src[consumed..][0..seq_len])) {
+            if (!writeUtf8Replacement(dst, &written)) break;
+            consumed += 1;
+            continue;
+        }
+        if (written + seq_len > dst.len) break;
+        @memcpy(dst[written..][0..seq_len], src[consumed..][0..seq_len]);
+        written += seq_len;
+        consumed += seq_len;
     }
-    if (i > 0) @memcpy(dst[0..i], src[0..i]);
-    return i;
+    return .{ .written = written, .consumed = consumed };
+}
+
+fn writeUtf8Replacement(dst: []u8, written: *usize) bool {
+    if (written.* + utf8_replacement.len > dst.len) return false;
+    @memcpy(dst[written.*..][0..utf8_replacement.len], utf8_replacement);
+    written.* += utf8_replacement.len;
+    return true;
 }
 
 fn utf8SequenceValid(seq: []const u8) bool {
@@ -318,35 +410,51 @@ pub const PlatformBackend = struct {
     }
 };
 
-test "utf-8 copy stops on a codepoint boundary" {
+test "utf-8 copy stops on a codepoint boundary and replaces invalid bytes" {
     const nihao = "你好";
     var buf: [4]u8 = undefined;
     const n = copyUtf8Bounded(&buf, nihao);
-    try std.testing.expectEqual(@as(usize, 3), n);
-    try std.testing.expectEqualStrings("你", buf[0..n]);
+    try std.testing.expectEqual(@as(usize, 3), n.written);
+    try std.testing.expectEqual(@as(usize, 3), n.consumed);
+    try std.testing.expectEqualStrings("你", buf[0..n.written]);
 
     var tight: [2]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), copyUtf8Bounded(&tight, "你"));
+    const tight_copy = copyUtf8Bounded(&tight, "你");
+    try std.testing.expectEqual(@as(usize, 0), tight_copy.written);
+    try std.testing.expectEqual(@as(usize, 0), tight_copy.consumed);
 
     var mid: [3]u8 = undefined;
     const n2 = copyUtf8Bounded(&mid, "a你");
-    try std.testing.expectEqualStrings("a", mid[0..n2]);
+    try std.testing.expectEqualStrings("a", mid[0..n2.written]);
+    try std.testing.expectEqual(@as(usize, 1), n2.consumed);
 
     var emo: [3]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), copyUtf8Bounded(&emo, "🙂"));
+    const emo_copy = copyUtf8Bounded(&emo, "🙂");
+    try std.testing.expectEqual(@as(usize, 0), emo_copy.written);
+    try std.testing.expectEqual(@as(usize, 0), emo_copy.consumed);
     var emo_ok: [4]u8 = undefined;
     const n3 = copyUtf8Bounded(&emo_ok, "🙂");
-    try std.testing.expectEqualStrings("🙂", emo_ok[0..n3]);
+    try std.testing.expectEqualStrings("🙂", emo_ok[0..n3.written]);
 
     var bad: [8]u8 = undefined;
     const n4 = copyUtf8Bounded(&bad, "ok\xff!");
-    try std.testing.expectEqualStrings("ok", bad[0..n4]);
+    try std.testing.expectEqualStrings("ok" ++ utf8_replacement ++ "!", bad[0..n4.written]);
+    try std.testing.expectEqual(@as(usize, 4), n4.consumed);
+
+    // 放不下 U+FFFD 时不消费这个坏字节，下一块空缓冲还能补上。
+    var bad_tight: [4]u8 = undefined;
+    const n4b = copyUtf8Bounded(&bad_tight, "ok\xff!");
+    try std.testing.expectEqualStrings("ok", bad_tight[0..n4b.written]);
+    try std.testing.expectEqual(@as(usize, 2), n4b.consumed);
 
     var partial: [8]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), copyUtf8Bounded(&partial, "你"[0..2]));
+    const partial_copy = copyUtf8Bounded(&partial, "你"[0..2]);
+    try std.testing.expectEqualStrings(utf8_replacement, partial[0..partial_copy.written]);
+    try std.testing.expectEqual(@as(usize, 2), partial_copy.consumed);
 
     var exact: [6]u8 = undefined;
-    try std.testing.expectEqualStrings("你好", exact[0..copyUtf8Bounded(&exact, "你好")]);
+    const exact_copy = copyUtf8Bounded(&exact, "你好");
+    try std.testing.expectEqualStrings("你好", exact[0..exact_copy.written]);
 }
 
 test "text events keep whole codepoints inside the fixed buffer" {
@@ -409,6 +517,29 @@ test "physical pixels and logical normalization work across macOS and Windows 20
     try std.testing.expectEqual(@as(f32, 960), mac_mouse.x);
     try std.testing.expectEqual(@as(f32, 540), mac_mouse.y);
 
+    // 调用方要 800×600 逻辑尺寸。macOS 窗口坐标已经是逻辑点，不用改。
+    const mac_create = windowSizeForRequestedLogical(800, 600, 800, 600, 800, 600);
+    try std.testing.expectEqual(@as(i32, 800), mac_create.w);
+    try std.testing.expectEqual(@as(i32, 600), mac_create.h);
+
+    // Windows/X11 200%：SDL_CreateWindow(800, 600) 的窗口坐标就是 800×600 像素，
+    // 归一化逻辑只有 400×300。窗口坐标要调到 1600×1200，逻辑尺寸才回到 800×600。
+    const win_create = windowSizeForRequestedLogical(800, 600, 800, 600, 400, 300);
+    try std.testing.expectEqual(@as(i32, 1600), win_create.w);
+    try std.testing.expectEqual(@as(i32, 1200), win_create.h);
+    const win_after = metricsFromPlatformSizes(.{
+        .logical_width = win_create.w,
+        .logical_height = win_create.h,
+        .pixel_width = win_create.w,
+        .pixel_height = win_create.h,
+        .pixel_density = 1,
+        .content_scale = 2,
+    });
+    try std.testing.expectEqual(@as(f32, 800), win_after.logical_width);
+    try std.testing.expectEqual(@as(f32, 600), win_after.logical_height);
+    try std.testing.expectEqual(@as(f32, 2), win_after.scale_factor);
+    try std.testing.expectEqual(@as(u32, 1600), win_after.physicalWidth());
+
     // 分数倍缩放下，交换链像素仍以 SizeInPixels 为准。
     const odd = metricsFromPlatformSizes(.{
         .logical_width = 801,
@@ -442,14 +573,21 @@ test "physical pixels and logical normalization work across macOS and Windows 20
     try std.testing.expectEqual(@as(u32, 200), derived.physicalWidth());
 }
 
-test "appendTextInputChunks preserves full >256-byte Chinese and Emoji payload" {
-    const gpa = std.testing.allocator;
-    // 构造 90 个汉字 + 5 个 Emoji = 290 字节（大于单包 256 字节）
+fn longTextFixture() [308]u8 {
+    // 11 份「8 个汉字 + 1 个 emoji」= 28×11 = 308 字节，大于单包 256。
     const unit = "你好世界测试文本😀";
-    var src: [unit.len * 11]u8 = undefined;
+    std.debug.assert(unit.len == 28);
+    var src: [308]u8 = undefined;
     for (0..11) |k| {
         @memcpy(src[k * unit.len ..][0..unit.len], unit);
     }
+    return src;
+}
+
+test "appendTextInputChunks preserves full >256-byte Chinese and Emoji payload" {
+    const gpa = std.testing.allocator;
+    const src = longTextFixture();
+    try std.testing.expectEqual(@as(usize, 308), src.len);
 
     var events: std.ArrayList(Event) = .empty;
     defer events.deinit(gpa);
@@ -467,24 +605,61 @@ test "appendTextInputChunks preserves full >256-byte Chinese and Emoji payload" 
     try std.testing.expectEqualStrings(&src, reassembled.items);
 }
 
-test "appendTextInputChunks rolls back on OOM without leaving partial chunks" {
-    const unit = "你好世界测试文本😀";
-    var src: [unit.len * 11]u8 = undefined;
-    for (0..11) |k| {
-        @memcpy(src[k * unit.len ..][0..unit.len], unit);
-    }
+test "appendTextInputChunks keeps text after an invalid byte" {
+    const gpa = std.testing.allocator;
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(gpa);
+    try appendTextInputChunks(gpa, &events, "ok\xff世界");
 
-    // 第 0 次分配：精确只给 1 个槽位，让第 1 个分片顺利写入；第 2 个分片扩容（remap/alloc）时必然触发 OOM
+    var reassembled: std.ArrayList(u8) = .empty;
+    defer reassembled.deinit(gpa);
+    for (events.items) |ev| {
+        try reassembled.appendSlice(gpa, ev.text_input.slice());
+    }
+    try std.testing.expectEqualStrings("ok" ++ utf8_replacement ++ "世界", reassembled.items);
+}
+
+test "appendTextInputChunks rolls back on OOM without leaving partial chunks" {
+    const src = longTextFixture();
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(std.testing.allocator);
+    // 容量精确为 1：第一片用现成的槽，第二片无论走 alloc 还是 remap 都会失败。
+    try events.ensureTotalCapacityPrecise(std.testing.allocator, 1);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        .fail_index = 1,
+        .fail_index = 0,
         .resize_fail_index = 0,
     });
-    var events: std.ArrayList(Event) = .empty;
-    defer events.deinit(failing.allocator());
-    try events.ensureTotalCapacityPrecise(failing.allocator(), 1);
 
     try std.testing.expectError(error.OutOfMemory, appendTextInputChunks(failing.allocator(), &events, &src));
     try std.testing.expectEqual(@as(usize, 0), events.items.len);
+}
+
+test "queueTextInputChunks reports the OOM prefix and keeps earlier events" {
+    const src = longTextFixture();
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(std.testing.allocator);
+    try events.ensureTotalCapacityPrecise(std.testing.allocator, 1);
+    events.appendAssumeCapacity(textInputFromUtf8("keep"));
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+        .resize_fail_index = 0,
+    });
+    const planned = queueTextInputChunks(failing.allocator(), &events, &src);
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqualStrings("keep", events.items[0].text_input.slice());
+
+    switch (planned) {
+        .queued => try std.testing.expect(false),
+        .oom_prefix => |ev| {
+            const prefix = ev.text_input.slice();
+            try std.testing.expect(prefix.len > 0);
+            try std.testing.expect(prefix.len <= text_byte_cap);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
+            try std.testing.expect(std.mem.startsWith(u8, &src, prefix));
+            try std.testing.expect(prefix.len < src.len);
+        },
+    }
 }
 
 test "mouse button codes match SDL_BUTTON values" {

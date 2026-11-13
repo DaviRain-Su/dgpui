@@ -35,6 +35,12 @@ pub const SdlBackend = struct {
     /// 绘制时如果 acquire 带回了非 0 的纹理尺寸，会再用那个值覆盖。
     pixel_width: u32,
     pixel_height: u32,
+    /// 最近一次 resize / 像素尺寸 / 缩放 / 换屏事件刷新的指标。
+    /// 鼠标坐标和 `metrics()` 都读它，避免每个事件再打一轮 SDL 查询，
+    /// 也避免还没处理 `scale_changed` 时鼠标已经用了新缩放。
+    cached_metrics: platform.WindowMetrics,
+    cached_window_w: i32,
+    cached_window_h: i32,
     /// TODO(PR2): 只记录，不参与裁剪。本帧仍然整屏 LOADOP_CLEAR。
     last_damage_rect: ?math.Rect,
     /// 超长 TEXT_INPUT 拆分后的待派发事件队列
@@ -54,6 +60,10 @@ pub const SdlBackend = struct {
             return SdlError.WindowCreateFailed;
         };
         errdefer c.SDL_DestroyWindow(window);
+        // `width`/`height` 是期望的逻辑尺寸。Windows/X11 的窗口坐标是像素，
+        // 200% 下直接 CreateWindow(800, 600) 归一化后只有 400×300。
+        // 这里按「窗口坐标 / 当前逻辑尺寸」把窗口放大，让逻辑尺寸回到请求值。
+        adjustWindowToRequestedLogical(window, width, height);
 
         // 在 macOS 下，SDL_GPU 会优先选择 Metal；也同时声明 SPIR-V/MSL 以便跨平台
         const gpu_device = c.SDL_CreateGPUDevice(
@@ -90,11 +100,16 @@ pub const SdlBackend = struct {
             .cursor_text = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_TEXT),
             .pixel_width = 1,
             .pixel_height = 1,
+            .cached_metrics = .{
+                .logical_width = 1,
+                .logical_height = 1,
+                .scale_factor = 1,
+            },
+            .cached_window_w = 1,
+            .cached_window_h = 1,
             .last_damage_rect = null,
         };
-        const metrics = self.queryMetrics();
-        self.pixel_width = metrics.physicalWidth();
-        self.pixel_height = metrics.physicalHeight();
+        _ = self.refreshMetrics();
         return self;
     }
 
@@ -124,36 +139,88 @@ pub const SdlBackend = struct {
         };
     }
 
-    fn queryMetrics(self: *const SdlBackend) platform.WindowMetrics {
-        var logical_w: c_int = 0;
-        var logical_h: c_int = 0;
-        if (!c.SDL_GetWindowSize(self.window, &logical_w, &logical_h)) {
-            logical_w = 1;
-            logical_h = 1;
+    fn adjustWindowToRequestedLogical(window: *c.SDL_Window, requested_w: i32, requested_h: i32) void {
+        if (!c.SDL_SyncWindow(window)) {
+            std.log.warn("SDL_SyncWindow before measuring failed: {s}", .{c.SDL_GetError()});
+        }
+        var win_w: c_int = 0;
+        var win_h: c_int = 0;
+        if (!c.SDL_GetWindowSize(window, &win_w, &win_h) or win_w <= 0 or win_h <= 0) return;
+        var pixel_w: c_int = 0;
+        var pixel_h: c_int = 0;
+        const pixels_ok = c.SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
+        const metrics = platform.metricsFromPlatformSizes(.{
+            .logical_width = win_w,
+            .logical_height = win_h,
+            .pixel_width = if (pixels_ok) pixel_w else null,
+            .pixel_height = if (pixels_ok) pixel_h else null,
+            .pixel_density = c.SDL_GetWindowPixelDensity(window),
+            .content_scale = c.SDL_GetWindowDisplayScale(window),
+        });
+        const next = platform.windowSizeForRequestedLogical(
+            requested_w,
+            requested_h,
+            win_w,
+            win_h,
+            metrics.logical_width,
+            metrics.logical_height,
+        );
+        if (next.w == win_w and next.h == win_h) return;
+        std.log.info("requested logical {d}x{d}, window coords {d}x{d} normalized to {d:.0}x{d:.0}; resizing to {d}x{d}", .{
+            requested_w,
+            requested_h,
+            win_w,
+            win_h,
+            metrics.logical_width,
+            metrics.logical_height,
+            next.w,
+            next.h,
+        });
+        if (!c.SDL_SetWindowSize(window, next.w, next.h)) {
+            std.log.err("SDL_SetWindowSize failed: {s}", .{c.SDL_GetError()});
+            return;
+        }
+        if (!c.SDL_SyncWindow(window)) {
+            std.log.warn("SDL_SyncWindow after resize failed: {s}", .{c.SDL_GetError()});
+        }
+    }
+
+    fn refreshMetrics(self: *SdlBackend) platform.WindowMetrics {
+        var win_w: c_int = 0;
+        var win_h: c_int = 0;
+        if (!c.SDL_GetWindowSize(self.window, &win_w, &win_h) or win_w <= 0 or win_h <= 0) {
+            win_w = 1;
+            win_h = 1;
         }
         var pixel_w: c_int = 0;
         var pixel_h: c_int = 0;
         const pixels_ok = c.SDL_GetWindowSizeInPixels(self.window, &pixel_w, &pixel_h);
-        // 物理像素用 SizeInPixels。scale_factor 用像素密度，不用 display scale。
-        // 见 platform.metricsFromPlatformSizes 的测试：Windows 200% 时两者不相等。
-        return platform.metricsFromPlatformSizes(.{
-            .logical_width = logical_w,
-            .logical_height = logical_h,
+        // 物理像素用 SizeInPixels。
+        // 两者都在时，logical = pixel / content_scale，scale_factor 就是 content_scale。
+        // pixel_density 另存在 metrics.pixel_density，不再塞进 scale_factor。
+        const metrics = platform.metricsFromPlatformSizes(.{
+            .logical_width = win_w,
+            .logical_height = win_h,
             .pixel_width = if (pixels_ok) pixel_w else null,
             .pixel_height = if (pixels_ok) pixel_h else null,
             .pixel_density = c.SDL_GetWindowPixelDensity(self.window),
             .content_scale = c.SDL_GetWindowDisplayScale(self.window),
         });
+        self.cached_window_w = win_w;
+        self.cached_window_h = win_h;
+        self.cached_metrics = metrics;
+        self.pixel_width = metrics.physicalWidth();
+        self.pixel_height = metrics.physicalHeight();
+        return metrics;
     }
 
     fn windowToLogical(self: *const SdlBackend, wx: f32, wy: f32) math.Point {
-        var win_w: c_int = 0;
-        var win_h: c_int = 0;
-        if (!c.SDL_GetWindowSize(self.window, &win_w, &win_h)) {
-            win_w = 1;
-            win_h = 1;
-        }
-        return platform.windowPointToLogical(win_w, win_h, self.queryMetrics(), .{ .x = wx, .y = wy });
+        return platform.windowPointToLogical(
+            self.cached_window_w,
+            self.cached_window_h,
+            self.cached_metrics,
+            .{ .x = wx, .y = wy },
+        );
     }
 
     fn popPending(self: *SdlBackend) ?platform.Event {
@@ -179,10 +246,10 @@ pub const SdlBackend = struct {
             // （跨屏、分数倍缩放时两者可以不同时发生）。两种都重新读 SizeInPixels。
             // SDL_GPU 的 Vulkan 后端也是盯着 PIXEL_SIZE_CHANGED 重建交换链。
             c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => .{
-                .resized = self.queryMetrics(),
+                .resized = self.refreshMetrics(),
             },
-            c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED => .{
-                .scale_changed = self.queryMetrics(),
+            c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, c.SDL_EVENT_WINDOW_DISPLAY_CHANGED => .{
+                .scale_changed = self.refreshMetrics(),
             },
             c.SDL_EVENT_WINDOW_EXPOSED => .redraw_requested,
             c.SDL_EVENT_MOUSE_MOTION => .{
@@ -217,15 +284,14 @@ pub const SdlBackend = struct {
             c.SDL_EVENT_TEXT_INPUT => blk: {
                 const text = eventText(raw.text.text);
                 if (text.len == 0) break :blk null;
-                const start_idx = self.pending_events.items.len;
-                platform.appendTextInputChunks(self.allocator, &self.pending_events, text) catch {
-                    // 原子回滚到 start_idx，防止部分分片留在队列中导致前缀重复派发
-                    self.pending_events.shrinkRetainingCapacity(start_idx);
-                    if (self.pending_events.items.len == 0) self.pending_head = 0;
-                    break :blk platform.textInputFromUtf8(text);
-                };
-                if (self.pending_events.items.len == start_idx) break :blk null;
-                break :blk self.popPending();
+                // 回滚在 appendTextInputChunks 的 errdefer 里做完。这里不再 shrink 一次。
+                switch (platform.queueTextInputChunks(self.allocator, &self.pending_events, text)) {
+                    .queued => break :blk self.popPending(),
+                    .oom_prefix => |ev| {
+                        std.log.err("text input OOM; kept {d} bytes and dropped the rest", .{ev.text_input.len});
+                        break :blk if (ev.text_input.len == 0) null else ev;
+                    },
+                }
             },
             // 候选词列表（TEXT_EDITING_CANDIDATES）还没翻译，UI 也还不会画。
             c.SDL_EVENT_TEXT_EDITING => platform.textEditingFromUtf8(
@@ -287,7 +353,7 @@ pub const SdlBackend = struct {
         .metrics = struct {
             fn call(ptr: *anyopaque) platform.WindowMetrics {
                 const self: *SdlBackend = @ptrCast(@alignCast(ptr));
-                return self.queryMetrics();
+                return self.cached_metrics;
             }
         }.call,
         .requestRedraw = struct {
@@ -382,6 +448,8 @@ pub const SdlBackend = struct {
                 // acquire 回来的纹理尺寸会再覆盖一次（见 renderFrame）。
                 self.pixel_width = @max(physical_width, 1);
                 self.pixel_height = @max(physical_height, 1);
+                self.cached_metrics.pixel_width = self.pixel_width;
+                self.cached_metrics.pixel_height = self.pixel_height;
             }
         }.call,
         .deinit = struct {

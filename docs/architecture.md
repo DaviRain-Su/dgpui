@@ -45,7 +45,7 @@
 
 ### Step 1：窗口、事件循环与多后端抽象（`PlatformBackend` + `RendererBackend`）——已实现
 
-物理像素用 `SDL_GetWindowSizeInPixels`，不要用逻辑尺寸乘 `SDL_GetWindowDisplayScale`。后者是“内容该放大多少”，在 Windows 200% 缩放时可以是 2，而窗口坐标本身已经是像素，乘上去会把交换链算成两倍大。像素密度（`SDL_GetWindowPixelDensity`）才是窗口坐标到像素的比值。详见 `docs/pr1-backend-and-window.md`。
+物理像素用 `SDL_GetWindowSizeInPixels`。逻辑尺寸是 `像素 / content_scale`（`SDL_GetWindowDisplayScale`），`scale_factor` 在这条路径上就是 content scale，像素密度另记。Windows/X11 200% 时窗口坐标本身是像素，`SDL_CreateWindow(800, 600)` 会得到 400×300 的逻辑尺寸，所以创建后会把窗口坐标按比例放大，让请求的逻辑尺寸落地。详见 `docs/pr1-backend-and-window.md`。
 
 - **解决什么问题**：GUI 框架的核心算法（布局、事件、状态）不应该直接 `import SDL` 或 `import Metal`。否则换个平台（比如 Linux 无窗口嵌入式 `DRM/KMS`、或者无头单元测试）就跑不动了。
 - **怎么做**：

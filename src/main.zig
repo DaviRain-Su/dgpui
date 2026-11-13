@@ -16,11 +16,12 @@ const DemoState = struct {
                 std.log.info("mouse_down at ({d:.1}, {d:.1}), clicks={d}", .{ md.pos.x, md.pos.y, self.clicks });
             },
             .resized => |m| {
-                std.log.info("window resized: logical={d:.0}x{d:.0} density={d:.2} content_scale={d:.2} pixels={d}x{d}", .{
+                std.log.info("window resized: logical={d:.0}x{d:.0} scale={d:.2} content_scale={d:.2} pixel_density={d:.2} pixels={d}x{d}", .{
                     m.logical_width,
                     m.logical_height,
                     m.scale_factor,
                     m.content_scale,
+                    m.pixel_density,
                     m.physicalWidth(),
                     m.physicalHeight(),
                 });
@@ -46,11 +47,12 @@ pub fn main(init: std.process.Init) !void {
     defer sdl.deinitSelf();
 
     const m = sdl.platformBackend().metrics();
-    std.log.info("PR 1 ready: logical={d:.0}x{d:.0}, density={d:.2}, content_scale={d:.2}, pixels={d}x{d}", .{
+    std.log.info("PR 1 ready: logical={d:.0}x{d:.0}, scale={d:.2}, content_scale={d:.2}, pixel_density={d:.2}, pixels={d}x{d}", .{
         m.logical_width,
         m.logical_height,
         m.scale_factor,
         m.content_scale,
+        m.pixel_density,
         m.physicalWidth(),
         m.physicalHeight(),
     });

@@ -145,7 +145,7 @@ test "event loop sleeps on idle and coalesces multiple redraw requests into 1 fr
     try std.testing.expectEqual(@as(?math.Rect, null), hb.last_damage_rect);
 }
 
-test "resize reports explicit pixel size instead of logical times content scale" {
+test "resize uses normalized metrics and keeps SizeInPixels" {
     var hb = HeadlessBackend.init(std.testing.allocator, .{
         .logical_width = 800,
         .logical_height = 600,
@@ -153,19 +153,28 @@ test "resize reports explicit pixel size instead of logical times content scale"
     });
     defer hb.deinitSelf();
 
-    // Windows 200% 那种数字：逻辑尺寸已经等于像素，content_scale 是 2，不能再乘一次。
-    try hb.pushEvent(.{ .resized = .{
-        .logical_width = 3840,
-        .logical_height = 2160,
-        .scale_factor = 1,
+    // 现在的 metricsFromPlatformSizes 不会再产出
+    // 「逻辑 3840、scale_factor 1、content_scale 2、像素 3840」。
+    // Windows 200% 调完窗口后是：窗口坐标 1600×1200，content_scale 2，
+    // 逻辑 800×600，scale_factor 2，像素仍是 1600×1200。
+    const normalized = platform.metricsFromPlatformSizes(.{
+        .logical_width = 1600,
+        .logical_height = 1200,
+        .pixel_width = 1600,
+        .pixel_height = 1200,
+        .pixel_density = 1,
         .content_scale = 2,
-        .pixel_width = 3840,
-        .pixel_height = 2160,
-    } });
+    });
+    try std.testing.expectEqual(@as(f32, 800), normalized.logical_width);
+    try std.testing.expectEqual(@as(f32, 600), normalized.logical_height);
+    try std.testing.expectEqual(@as(f32, 2), normalized.scale_factor);
+    try std.testing.expectEqual(@as(f32, 2), normalized.content_scale);
+    try std.testing.expectEqual(@as(f32, 1), normalized.pixel_density);
 
+    try hb.pushEvent(.{ .resized = normalized });
     var loop = AppLoop.init(hb.platformBackend(), hb.rendererBackend());
     try loop.run();
 
-    try std.testing.expectEqual(@as(u32, 3840), hb.last_resize_physical.?.w);
-    try std.testing.expectEqual(@as(u32, 2160), hb.last_resize_physical.?.h);
+    try std.testing.expectEqual(@as(u32, 1600), hb.last_resize_physical.?.w);
+    try std.testing.expectEqual(@as(u32, 1200), hb.last_resize_physical.?.h);
 }
