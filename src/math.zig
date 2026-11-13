@@ -81,6 +81,15 @@ pub const Rect = struct {
         };
     }
 
+    pub fn inflate(self: Rect, margin: f32) Rect {
+        return .{
+            .x = self.x - margin,
+            .y = self.y - margin,
+            .width = self.width + margin * 2,
+            .height = self.height + margin * 2,
+        };
+    }
+
     /// 逻辑像素矩形乘以 DPI 缩放，转换为物理像素矩形
     pub fn toPhysical(self: Rect, scale: f32) Rect {
         return .{

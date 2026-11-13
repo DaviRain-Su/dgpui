@@ -11,6 +11,7 @@ const c = @import("c");
 const math = @import("../math.zig");
 const platform = @import("platform.zig");
 const renderer = @import("renderer.zig");
+const sdl_scene = @import("sdl_scene.zig");
 
 pub const available = true;
 
@@ -41,8 +42,9 @@ pub const SdlBackend = struct {
     cached_metrics: platform.WindowMetrics,
     cached_window_w: i32,
     cached_window_h: i32,
-    /// TODO(PR2): 只记录，不参与裁剪。本帧仍然整屏 LOADOP_CLEAR。
+    /// 上一帧传进来的脏区。null 表示整屏。真正的剪刀在 `sdl_scene.paint`。
     last_damage_rect: ?math.Rect,
+    quads: sdl_scene.QuadRenderer,
     /// 超长 TEXT_INPUT 拆分后的待派发事件队列
     pending_events: std.ArrayList(platform.Event) = .empty,
     pending_head: usize = 0,
@@ -108,12 +110,14 @@ pub const SdlBackend = struct {
             .cached_window_w = 1,
             .cached_window_h = 1,
             .last_damage_rect = null,
+            .quads = .{ .device = gpu_device },
         };
         _ = self.refreshMetrics();
         return self;
     }
 
     pub fn deinitSelf(self: *SdlBackend) void {
+        self.quads.deinit();
         self.pending_events.deinit(self.allocator);
         if (self.cursor_arrow) |cur| c.SDL_DestroyCursor(cur);
         if (self.cursor_pointer) |cur| c.SDL_DestroyCursor(cur);
@@ -415,21 +419,7 @@ pub const SdlBackend = struct {
                 if (h != 0) self.pixel_height = h;
 
                 if (swapchain_tex) |tex| {
-                    var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
-                    color_target.texture = tex;
-                    color_target.clear_color = .{
-                        .r = params.clear_color.r,
-                        .g = params.clear_color.g,
-                        .b = params.clear_color.b,
-                        .a = params.clear_color.a,
-                    };
-                    color_target.load_op = c.SDL_GPU_LOADOP_CLEAR;
-                    color_target.store_op = c.SDL_GPU_STOREOP_STORE;
-
-                    const pass = c.SDL_BeginGPURenderPass(cmd_buf, &color_target, 1, null);
-                    if (pass) |p| {
-                        c.SDL_EndGPURenderPass(p);
-                    }
+                    self.quads.paint(cmd_buf, self.window, tex, w, h, params);
                 }
 
                 _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);

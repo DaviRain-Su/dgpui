@@ -2,7 +2,7 @@
 
 这份文档把 `dgpui` 的设计对应到 Rust GUI 岗位面试里的高频术语。
 
-> 截至 PR 1，代码里真正有的是 `PlatformBackend` / `RendererBackend`、Headless、SDL3 窗口和事件循环、`math.zig`。下文里的 `Entity`、`FrameArena`、`DisplayList`、HarfBuzz、Flex **都是目标设计，不是已经落地的代码**。没有单独标「已实现」的段落，默认是计划。实现是 AI 辅助的，设计与审查由本人负责。
+> 截至 PR 2，代码里有窗口/事件循环，以及 `FrameArena`、`DisplayList`、脏区并集、圆角 SDF（SPIR-V）。`glyph` 只记录。下文里的 `Entity`、HarfBuzz、Flex、无障碍 **仍是目标设计，不是已经落地的代码**。没有单独标「已实现」的段落，默认是计划。实现是 AI 辅助的，设计与审查由本人负责。
 
 ---
 
@@ -43,14 +43,14 @@
 面试常问：**`wgpu`、`Vello`、`Skia`、`FemtoVG` 分别干什么？为什么不止用其中一个？**
 
 - **`wgpu`（以及 `dgpui` 里的 `SDL_GPU`）**：**底层 GPU 硬件抽象层**（类似 Vulkan/Metal/DX12 的统一安全接口）。它只管 Buffer、Texture、Pipeline、Shader 和 Draw Call，**它自己不懂什么是圆角矩形或贝塞尔曲线**。
-- **`dgpui` 自写 SDF 着色器 + `GlyphAtlas`**：相当于用最精简的代码直接跑在 `wgpu` / `SDL_GPU` 上，专门解决“大量 UI 盒子 + 文本”的高性能绘制，**缺点是不擅长任意复杂矢量路径（如 SVG 复杂钢笔曲线）**。
+- **`dgpui` 的 SDF quad 着色器**：PR 2 用一份 SPIR-V 在 `SDL_GPU` 上画圆角、描边和阴影。`GlyphAtlas` 还没做。这套做法不擅长任意复杂矢量路径（如 SVG 钢笔曲线）。
 - **`Skia`**：老牌全能 2D 图形库（CPU 光栅化 + GPU 后端），Flutter/Chrome 都在用，功能极全但体积庞大、C++ FFI 较重。
 - **`FemtoVG`**：轻量级 OpenGL / wgpu 矢量绘图库（类似 HTML Canvas 2D API），把路径三角化后画在 GPU 上。
 - **`Vello`**：纯 Rust 现代 GPU-first 2D 矢量渲染引擎，**核心利用 GPU Compute Shader（计算着色器）做并行路径光栅化**，跑在 `wgpu` 之上。
 
 ### 局部重绘（Damage Region）与裁剪（Scissor）
-- **计划中的策略**：**脏视图触发重建 DisplayList -> 计算变化的 Damage Bounds（脏矩形并集）-> 渲染后端根据 Damage Region + Scissor Rect 控制重绘边界**。
-- **PR 1 的现状**：`FrameParams.damage_rect` 已经在渲染接口上，Headless / SDL 都会把它记下来。SDL 这一帧仍然 `LOADOP_CLEAR` 整屏，没有 scissor。`null` 表示整屏。
+- **目标**：脏视图触发重建 DisplayList，算出变化矩形的并集，渲染后端用这块做剪刀。组件树还没做，所以并集要调用方自己交进来，框架不会自动 diff。
+- **PR 2 的现状**：`DamageRegion` 会并矩形。`null` 仍表示整屏 `LOADOP_CLEAR`。有脏区时 `LOADOP_LOAD`，剪刀是脏区和 quad 裁剪的交。同一裁剪的 quad 一次实例化绘制。
 - 注意表述边界：除非专门实现了离屏纹理缓存（Offscreen Layer Cache / RenderTarget Cache），否则不要把“脏矩形计算 + Scissor 裁剪”夸大成“完整的多层离屏图层缓存”。
 
 ### 桌面窗口后端 vs 嵌入式 DRM/KMS

@@ -51,14 +51,16 @@
 - **怎么做**：
   - 定义两个接口（Zig 里的 struct + 函数指针 VTable，类似 Rust 的 `trait`）：
     - `PlatformBackend`：负责“等事件（休眠）、取窗口大小与 DPI 缩放比、切换鼠标光标、告诉系统需要重绘”。
-    - `RendererBackend`：以后只接收框架产出的 `DisplayList` 和 `DamageRegion`。PR 1 实际收到的是 `FrameParams`（逻辑尺寸、缩放、清屏色、可选 `damage_rect`），并把它画到屏幕（或记到 Headless）上。
+    - `RendererBackend`：收到 `FrameParams`。PR 2 起里面可以带 `DisplayList` 和脏区；没有清单时仍只清屏。
   - 提供两个实现：
     1. **`SdlBackend`**：用 SDL3 开窗口 + `SDL_GPU`（macOS 底层是 Metal），空闲时用 `SDL_WaitEvent` 挂起线程，CPU 占用 0%。
     2. **`HeadlessBackend`**：不弹窗口，把每帧收到的指令和事件记录下来，专门用于 `zig build test`。
 
 ---
 
-### Step 2：渲染中间层（`DisplayList`）、脏区（`DamageRegion`）与 SDF 着色器——计划中，还没有代码
+### Step 2：渲染中间层（`DisplayList`）、脏区（`DamageRegion`）与 SDF 着色器——已有最小实现
+
+清单、帧内存、脏区并集、CPU 上的距离公式，以及 SPIR-V 的实例化 quad 着色器已经在仓库里。`glyph` 命令先占位，不画。不同裁剪分成多批，没有模板缓冲。没有组件树时，脏区要调用方传进来。细节见 `docs/pr2-scene-and-sdf-quad.md`。
 
 - **解决什么问题**：如果布局完直接调 GPU API，代码会耦合死，也没法做局部重绘和单元测试。
 - **怎么做**：

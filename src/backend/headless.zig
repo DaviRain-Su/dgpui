@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const math = @import("../math.zig");
+const damage = @import("../damage.zig");
 const platform = @import("platform.zig");
 const renderer = @import("renderer.zig");
 
@@ -22,8 +23,12 @@ pub const HeadlessBackend = struct {
     rendered_frames: usize = 0,
     last_frame_params: ?renderer.FrameParams = null,
     /// `FrameParams.damage_rect` 的镜像。null 表示调用方要求整屏。
-    /// TODO(PR2): 局部重绘还没做，这个字段只用来证明渲染接口把脏区接住了。
     last_damage_rect: ?math.Rect = null,
+    last_clear_full: bool = true,
+    last_scissor: math.Rect = .{},
+    last_quad_count: usize = 0,
+    last_batch_count: usize = 0,
+    last_glyph_count: usize = 0,
     current_cursor: platform.CursorShape = .arrow,
     last_resize_physical: ?struct { w: u32, h: u32 } = null,
 
@@ -117,6 +122,24 @@ pub const HeadlessBackend = struct {
                 self.rendered_frames += 1;
                 self.last_frame_params = params;
                 self.last_damage_rect = params.damage_rect;
+                const plan = damage.presentPlan(
+                    params.damage_rect,
+                    params.logical_size.width,
+                    params.logical_size.height,
+                    params.scale_factor,
+                );
+                self.last_clear_full = plan.clear_full;
+                self.last_scissor = plan.scissor;
+                if (params.display_list) |list| {
+                    const draw = list.buildDraw() catch |err| return err;
+                    self.last_quad_count = draw.quads.len;
+                    self.last_batch_count = draw.batches.len;
+                    self.last_glyph_count = draw.glyph_count;
+                } else {
+                    self.last_quad_count = 0;
+                    self.last_batch_count = 0;
+                    self.last_glyph_count = 0;
+                }
             }
         }.call,
         .resize = struct {
@@ -158,13 +181,13 @@ test "headless backend records events and rendered frames" {
     try std.testing.expectEqual(@as(usize, 1), hb.rendered_frames);
     try std.testing.expectEqual(@as(?math.Rect, null), hb.last_damage_rect);
 
-    const damage = math.Rect.init(4, 5, 6, 7);
+    const dirty = math.Rect.init(4, 5, 6, 7);
     try rb.renderFrame(.{
         .logical_size = pb.metrics().logicalSize(),
         .scale_factor = pb.metrics().scale_factor,
         .clear_color = math.Color.fromHex(0x1e1e2e),
-        .damage_rect = damage,
+        .damage_rect = dirty,
     });
     try std.testing.expectEqual(@as(usize, 2), hb.rendered_frames);
-    try std.testing.expectEqual(damage, hb.last_damage_rect.?);
+    try std.testing.expectEqual(dirty, hb.last_damage_rect.?);
 }

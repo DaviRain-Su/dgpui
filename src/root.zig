@@ -3,9 +3,13 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-pub const version = "0.1.0-pr1";
+pub const version = "0.1.0-pr2";
 
 pub const math = @import("math.zig");
+pub const frame_arena = @import("frame_arena.zig");
+pub const sdf = @import("sdf.zig");
+pub const damage = @import("damage.zig");
+pub const display_list = @import("display_list.zig");
 pub const app = @import("app.zig");
 pub const backend = struct {
     pub const platform = @import("backend/platform.zig");
