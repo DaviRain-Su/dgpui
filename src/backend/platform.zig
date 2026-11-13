@@ -228,11 +228,15 @@ pub fn textEditingFromUtf8(src: []const u8, start: i32, length: i32) Event {
 
 /// 将任意长度的 UTF-8 文本按完整码点边界切分成一条或多条 `.text_input` 事件，
 /// 避免超长 IME 上屏或粘贴被 256 字节定长缓冲静默丢弃。
+/// 若中途分配失败，自动回滚到调用前的长度，保持原子性。
 pub fn appendTextInputChunks(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(Event),
     src: []const u8,
 ) !void {
+    const start_len = out.items.len;
+    errdefer out.shrinkRetainingCapacity(start_len);
+
     var rest = src;
     while (rest.len > 0) {
         var tb: TextBytes = .{};
@@ -461,6 +465,26 @@ test "appendTextInputChunks preserves full >256-byte Chinese and Emoji payload" 
         try reassembled.appendSlice(gpa, s);
     }
     try std.testing.expectEqualStrings(&src, reassembled.items);
+}
+
+test "appendTextInputChunks rolls back on OOM without leaving partial chunks" {
+    const unit = "你好世界测试文本😀";
+    var src: [unit.len * 11]u8 = undefined;
+    for (0..11) |k| {
+        @memcpy(src[k * unit.len ..][0..unit.len], unit);
+    }
+
+    // 第 0 次分配：精确只给 1 个槽位，让第 1 个分片顺利写入；第 2 个分片扩容（remap/alloc）时必然触发 OOM
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 1,
+        .resize_fail_index = 0,
+    });
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(failing.allocator());
+    try events.ensureTotalCapacityPrecise(failing.allocator(), 1);
+
+    try std.testing.expectError(error.OutOfMemory, appendTextInputChunks(failing.allocator(), &events, &src));
+    try std.testing.expectEqual(@as(usize, 0), events.items.len);
 }
 
 test "mouse button codes match SDL_BUTTON values" {

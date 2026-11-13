@@ -219,7 +219,9 @@ pub const SdlBackend = struct {
                 if (text.len == 0) break :blk null;
                 const start_idx = self.pending_events.items.len;
                 platform.appendTextInputChunks(self.allocator, &self.pending_events, text) catch {
-                    // OOM 回退：至少发出前 256 字节以内的完整码点
+                    // 原子回滚到 start_idx，防止部分分片留在队列中导致前缀重复派发
+                    self.pending_events.shrinkRetainingCapacity(start_idx);
+                    if (self.pending_events.items.len == 0) self.pending_head = 0;
                     break :blk platform.textInputFromUtf8(text);
                 };
                 if (self.pending_events.items.len == start_idx) break :blk null;
