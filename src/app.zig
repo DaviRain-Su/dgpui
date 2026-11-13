@@ -8,6 +8,8 @@
 
 const std = @import("std");
 const math = @import("math.zig");
+const arena = @import("arena.zig");
+const scene = @import("scene.zig");
 const platform = @import("backend/platform.zig");
 const renderer = @import("backend/renderer.zig");
 const HeadlessBackend = @import("backend/headless.zig").HeadlessBackend;
@@ -15,24 +17,44 @@ const HeadlessBackend = @import("backend/headless.zig").HeadlessBackend;
 pub const AppCallbacks = struct {
     ctx: *anyopaque,
     onEvent: ?*const fn (ctx: *anyopaque, ev: platform.Event, loop: *AppLoop) void = null,
+    onRender: ?*const fn (
+        ctx: *anyopaque,
+        dl: *scene.DisplayList,
+        frame_alloc: std.mem.Allocator,
+        metrics: platform.WindowMetrics,
+    ) anyerror!void = null,
 };
 
 pub const AppLoop = struct {
+    allocator: std.mem.Allocator,
     platform_backend: platform.PlatformBackend,
     renderer_backend: renderer.RendererBackend,
+    frame_arena: arena.FrameArena,
+    display_list: scene.DisplayList,
+    prev_display_list: ?scene.DisplayList = null,
     clear_color: math.Color = math.Color.fromHex(0x1e1e2e),
     needs_redraw: bool = true,
     running: bool = true,
     callbacks: ?AppCallbacks = null,
 
     pub fn init(
+        allocator: std.mem.Allocator,
         platform_backend: platform.PlatformBackend,
         renderer_backend: renderer.RendererBackend,
     ) AppLoop {
         return .{
+            .allocator = allocator,
             .platform_backend = platform_backend,
             .renderer_backend = renderer_backend,
+            .frame_arena = arena.FrameArena.init(allocator),
+            .display_list = scene.DisplayList.init(allocator),
         };
+    }
+
+    pub fn deinit(self: *AppLoop) void {
+        if (self.prev_display_list) |*prev| prev.deinit();
+        self.display_list.deinit();
+        self.frame_arena.deinit();
     }
 
     pub fn requestRedraw(self: *AppLoop) void {
@@ -101,14 +123,40 @@ pub const AppLoop = struct {
 
     fn drawOnce(self: *AppLoop) !void {
         self.needs_redraw = false;
+        defer self.frame_arena.reset();
+
         const m = self.platform_backend.metrics();
+        self.display_list.clearRetainingCapacity();
+
+        var has_scene = false;
+        if (self.callbacks) |cb| {
+            if (cb.onRender) |render_fn| {
+                try render_fn(cb.ctx, &self.display_list, self.frame_arena.allocator(), m);
+                has_scene = true;
+            }
+        }
+
+        const damage: ?math.Rect = if (has_scene and self.prev_display_list != null)
+            scene.DamageRegion.fromDisplayListDiff(&self.prev_display_list.?, &self.display_list).rect
+        else
+            null;
+
         try self.renderer_backend.renderFrame(.{
             .logical_size = m.logicalSize(),
             .scale_factor = m.scale_factor,
             .clear_color = self.clear_color,
-            // TODO(PR2): 这里还不会算脏区并集。null = 整屏。字段已经接到渲染后端，只是还不用来裁剪。
-            .damage_rect = null,
+            .display_list = if (has_scene) &self.display_list else null,
+            .damage_rect = damage,
         });
+
+        if (has_scene) {
+            if (self.prev_display_list) |*prev| {
+                prev.clearRetainingCapacity();
+                try prev.commands.appendSlice(self.allocator, self.display_list.commands.items);
+            } else {
+                self.prev_display_list = try self.display_list.clone(self.allocator);
+            }
+        }
     }
 };
 
@@ -133,7 +181,8 @@ test "event loop sleeps on idle and coalesces multiple redraw requests into 1 fr
     } });
     try hb.pushEvent(.redraw_requested);
 
-    var loop = AppLoop.init(hb.platformBackend(), hb.rendererBackend());
+    var loop = AppLoop.init(std.testing.allocator, hb.platformBackend(), hb.rendererBackend());
+    defer loop.deinit();
     try loop.run();
 
     // 首帧 1 次 + 批处理合并后 1 次 = 总共仅 2 帧（而不是 4 帧）
@@ -141,7 +190,7 @@ test "event loop sleeps on idle and coalesces multiple redraw requests into 1 fr
     try std.testing.expectEqual(@as(usize, 2), hb.wait_calls);
     try std.testing.expectEqual(@as(u32, 1200), hb.last_resize_physical.?.w);
     try std.testing.expectEqual(@as(u32, 800), hb.last_resize_physical.?.h);
-    // 主循环还没算脏区，传给渲染器的 damage_rect 保持 null（整屏）。
+    // 无场景回调时传给渲染器的 damage_rect 保持 null（整屏）。
     try std.testing.expectEqual(@as(?math.Rect, null), hb.last_damage_rect);
 }
 
@@ -153,10 +202,6 @@ test "resize uses normalized metrics and keeps SizeInPixels" {
     });
     defer hb.deinitSelf();
 
-    // 现在的 metricsFromPlatformSizes 不会再产出
-    // 「逻辑 3840、scale_factor 1、content_scale 2、像素 3840」。
-    // Windows 200% 调完窗口后是：窗口坐标 1600×1200，content_scale 2，
-    // 逻辑 800×600，scale_factor 2，像素仍是 1600×1200。
     const normalized = platform.metricsFromPlatformSizes(.{
         .logical_width = 1600,
         .logical_height = 1200,
@@ -172,9 +217,72 @@ test "resize uses normalized metrics and keeps SizeInPixels" {
     try std.testing.expectEqual(@as(f32, 1), normalized.pixel_density);
 
     try hb.pushEvent(.{ .resized = normalized });
-    var loop = AppLoop.init(hb.platformBackend(), hb.rendererBackend());
+    var loop = AppLoop.init(std.testing.allocator, hb.platformBackend(), hb.rendererBackend());
+    defer loop.deinit();
     try loop.run();
 
     try std.testing.expectEqual(@as(u32, 1600), hb.last_resize_physical.?.w);
     try std.testing.expectEqual(@as(u32, 1200), hb.last_resize_physical.?.h);
+}
+
+test "AppLoop resets FrameArena each frame and computes DamageRegion between frames" {
+    const SceneState = struct {
+        active: bool = false,
+
+        fn onEvent(ctx: *anyopaque, ev: platform.Event, loop: *AppLoop) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (ev == .mouse_down) {
+                self.active = !self.active;
+                loop.requestRedraw();
+            }
+        }
+
+        fn onRender(
+            ctx: *anyopaque,
+            dl: *scene.DisplayList,
+            frame_alloc: std.mem.Allocator,
+            _: platform.WindowMetrics,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // 从 FrameArena 分配一笔临时字符串，验证帧末会释放容量复用且不泄漏
+            _ = try frame_alloc.dupe(u8, "frame-temp");
+
+            try dl.pushQuad(.{
+                .bounds = math.Rect.init(0, 0, 800, 600),
+                .background = math.Color.fromHex(0x1e1e2e),
+            });
+            try dl.pushQuad(.{
+                .bounds = math.Rect.init(50, 60, 120, 40),
+                .background = if (self.active) math.Color.fromHex(0x89b4fa) else math.Color.fromHex(0x313244),
+                .corner_radius = 8,
+            });
+        }
+    };
+
+    var hb = HeadlessBackend.init(std.testing.allocator, .{
+        .logical_width = 800,
+        .logical_height = 600,
+        .scale_factor = 2.0,
+    });
+    defer hb.deinitSelf();
+
+    try hb.pushEvent(.{ .mouse_down = .{ .pos = .{ .x = 80, .y = 75 }, .button = .left, .clicks = 1 } });
+
+    var st = SceneState{};
+    var loop = AppLoop.init(std.testing.allocator, hb.platformBackend(), hb.rendererBackend());
+    defer loop.deinit();
+    loop.callbacks = .{
+        .ctx = &st,
+        .onEvent = SceneState.onEvent,
+        .onRender = SceneState.onRender,
+    };
+
+    try loop.run();
+
+    try std.testing.expectEqual(@as(usize, 2), hb.rendered_frames);
+    try std.testing.expectEqual(@as(usize, 2), loop.frame_arena.frame_count);
+    try std.testing.expectEqual(@as(usize, 1), hb.last_batch_count);
+    try std.testing.expectEqual(@as(usize, 2), hb.last_instance_count);
+    // 第 2 帧只有 (50, 60, 120, 40) 变色了，背景没变，所以脏区精确等于按钮矩形
+    try std.testing.expectEqual(math.Rect.init(50, 60, 120, 40), hb.last_damage_rect.?);
 }

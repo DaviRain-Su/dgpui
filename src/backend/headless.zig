@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const math = @import("../math.zig");
+const scene = @import("../scene.zig");
 const platform = @import("platform.zig");
 const renderer = @import("renderer.zig");
 
@@ -21,9 +22,10 @@ pub const HeadlessBackend = struct {
     redraw_requests: usize = 0,
     rendered_frames: usize = 0,
     last_frame_params: ?renderer.FrameParams = null,
-    /// `FrameParams.damage_rect` 的镜像。null 表示调用方要求整屏。
-    /// TODO(PR2): 局部重绘还没做，这个字段只用来证明渲染接口把脏区接住了。
     last_damage_rect: ?math.Rect = null,
+    last_command_count: usize = 0,
+    last_batch_count: usize = 0,
+    last_instance_count: usize = 0,
     current_cursor: platform.CursorShape = .arrow,
     last_resize_physical: ?struct { w: u32, h: u32 } = null,
 
@@ -117,6 +119,17 @@ pub const HeadlessBackend = struct {
                 self.rendered_frames += 1;
                 self.last_frame_params = params;
                 self.last_damage_rect = params.damage_rect;
+                if (params.display_list) |dl| {
+                    self.last_command_count = dl.commands.items.len;
+                    var built = try dl.buildBatches(self.allocator);
+                    defer built.deinit(self.allocator);
+                    self.last_batch_count = built.batches.len;
+                    self.last_instance_count = built.instances.len;
+                } else {
+                    self.last_command_count = 0;
+                    self.last_batch_count = 0;
+                    self.last_instance_count = 0;
+                }
             }
         }.call,
         .resize = struct {
