@@ -43,20 +43,22 @@
 
 ## 二、六个 PR 模块逐一说明
 
-### Step 1：窗口、事件循环与多后端抽象（`PlatformBackend` + `RendererBackend`）
+### Step 1：窗口、事件循环与多后端抽象（`PlatformBackend` + `RendererBackend`）——已实现
+
+物理像素用 `SDL_GetWindowSizeInPixels`，不要用逻辑尺寸乘 `SDL_GetWindowDisplayScale`。后者是“内容该放大多少”，在 Windows 200% 缩放时可以是 2，而窗口坐标本身已经是像素，乘上去会把交换链算成两倍大。像素密度（`SDL_GetWindowPixelDensity`）才是窗口坐标到像素的比值。详见 `docs/pr1-backend-and-window.md`。
 
 - **解决什么问题**：GUI 框架的核心算法（布局、事件、状态）不应该直接 `import SDL` 或 `import Metal`。否则换个平台（比如 Linux 无窗口嵌入式 `DRM/KMS`、或者无头单元测试）就跑不动了。
 - **怎么做**：
   - 定义两个接口（Zig 里的 struct + 函数指针 VTable，类似 Rust 的 `trait`）：
     - `PlatformBackend`：负责“等事件（休眠）、取窗口大小与 DPI 缩放比、切换鼠标光标、告诉系统需要重绘”。
-    - `RendererBackend`：只接收框架产出的 `DisplayList` 和 `DamageRegion`，把它画到屏幕（或内存）上。
+    - `RendererBackend`：以后只接收框架产出的 `DisplayList` 和 `DamageRegion`。PR 1 实际收到的是 `FrameParams`（逻辑尺寸、缩放、清屏色、可选 `damage_rect`），并把它画到屏幕（或记到 Headless）上。
   - 提供两个实现：
     1. **`SdlBackend`**：用 SDL3 开窗口 + `SDL_GPU`（macOS 底层是 Metal），空闲时用 `SDL_WaitEvent` 挂起线程，CPU 占用 0%。
     2. **`HeadlessBackend`**：不弹窗口，把每帧收到的指令和事件记录下来，专门用于 `zig build test`。
 
 ---
 
-### Step 2：渲染中间层（`DisplayList`）、脏区（`DamageRegion`）与 SDF 着色器
+### Step 2：渲染中间层（`DisplayList`）、脏区（`DamageRegion`）与 SDF 着色器——计划中，还没有代码
 
 - **解决什么问题**：如果布局完直接调 GPU API，代码会耦合死，也没法做局部重绘和单元测试。
 - **怎么做**：
@@ -73,7 +75,7 @@
 
 ---
 
-### Step 3：文字排版与字形图集（HarfBuzz + FreeType2 + `GlyphAtlas`）
+### Step 3：文字排版与字形图集（HarfBuzz + FreeType2 + `GlyphAtlas`）——计划中，还没有代码
 
 - **解决什么问题**：GPU 不认识 `.ttf` 字体文件。而且一行字里可能有英文连字（`fi`）、中英文混排，每个字宽都不同。
 - **三条流水线**：
@@ -83,7 +85,7 @@
 
 ---
 
-### Step 4：链式 DSL 与手写 Flex 布局引擎
+### Step 4：链式 DSL 与手写 Flex 布局引擎——计划中，还没有代码
 
 - **解决什么问题**：开发者不想手写 `x = 16, y = 48, w = 368...`。他们想写：
   ```zig
@@ -93,14 +95,14 @@
 - **布局最核心的难点**：**高度往往取决于宽度**。
   - 当容器宽 400px 时，一段 20 个字的中文只占 1 行（高 24px）；当窗口被拖窄到 200px 时，文字必须折成 3 行（高 72px），下面的按钮必须自动下移。
 - **怎么做**：
-  - 手写一个精简但结构标准的 Flex 引擎（参考 Yoga/Taffy 思路）：
+  - 手写一个精简但结构标准的 Flex 引擎（参考 Yoga/Taffy 的布局模型，不链接 Yoga 这个库）：
     1. 容器把可用宽度约束 `AvailableSpace`（定长 / 最大内容 / 无限制）往下传。
     2. 遇到叶子节点（文字），调用 **`measure_text(text, max_width)` 回调**，算出折行后的宽高。
     3. 容器根据 `flex_grow` / `flex_shrink` 分配剩余空间或压缩，最后根据 `justify_content` / `align_items` 确定绝对坐标 `(x, y)`。
 
 ---
 
-### Step 5：持久状态 `EntityStore`、命中测试（Hitbox）与事件闭环
+### Step 5：持久状态 `EntityStore`、命中测试（Hitbox）与事件闭环——计划中，还没有代码
 
 - **解决什么问题**：点击屏幕某个坐标 `(x, y)` 时，怎么找到对应组件、修改状态、并且只重绘受影响的视图？
 - **怎么做**：
@@ -111,7 +113,7 @@
 
 ---
 
-### Step 6：滚动、焦点输入与 `comptime` DSL 对比实验
+### Step 6：滚动、焦点输入与 `comptime` DSL 对比实验——计划中，还没有代码
 
 - **解决什么问题**：
   1. 列表内容超出窗口高度怎么办？-> 滚轮事件改变 `Entity` 里的 `scroll_offset`，渲染时包一层 `PushClip(box)` 并整体平移子节点坐标。
