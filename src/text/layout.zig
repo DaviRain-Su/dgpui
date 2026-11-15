@@ -13,7 +13,8 @@ const atlas = @import("atlas.zig");
 pub const PreparedGlyph = struct {
     /// 逻辑像素下的目标矩形
     bounds: math.Rect,
-    /// 图集 UV（归一化 0..1）
+    /// 图集**像素**坐标（不归一化）。图集可能在本帧中途扩容，
+    /// 归一化推迟到 buildBatches 时用最终宽高做，早前 run 的 UV 才不会失效。
     uv: math.Rect,
     color: math.Color,
 };
@@ -130,16 +131,17 @@ pub const TextSystem = struct {
                     .height = @as(f32, @floatFromInt(uv_px.height)) * inv_scale,
                 };
 
-                const aw: f32 = @floatFromInt(self.atlas.width);
-                const ah: f32 = @floatFromInt(self.atlas.height);
-                const uv_left = @as(f32, @floatFromInt(uv_px.x)) / aw;
-                const uv_top = @as(f32, @floatFromInt(uv_px.y)) / ah;
-                const uv_right = @as(f32, @floatFromInt(uv_px.x + uv_px.width)) / aw;
-                const uv_bottom = @as(f32, @floatFromInt(uv_px.y + uv_px.height)) / ah;
+                // UV 保持图集像素坐标；归一化推迟到 buildBatches（图集可能还会长大）
+                const uv_rect = math.Rect.init(
+                    @floatFromInt(uv_px.x),
+                    @floatFromInt(uv_px.y),
+                    @floatFromInt(uv_px.width),
+                    @floatFromInt(uv_px.height),
+                );
 
                 glyphs[out_i] = .{
                     .bounds = bounds,
-                    .uv = math.Rect.init(uv_left, uv_top, uv_right - uv_left, uv_bottom - uv_top),
+                    .uv = uv_rect,
                     .color = opts.color,
                 };
                 out_i += 1;

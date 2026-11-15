@@ -43,7 +43,9 @@ pub const Quad = struct {
     }
 };
 
-/// 贴字形小图用的矩形（逻辑像素 bounds + 图集归一化 UV）
+/// 贴字形小图用的矩形（逻辑像素 bounds + 图集**像素**坐标 UV）。
+/// UV 不在这里归一化：图集可能在本帧中途扩容，归一化必须等最终尺寸确定后，
+/// 在 buildBatches 时用图集真实宽高做（见 GlyphInstance.fromGlyph）。
 pub const GlyphQuad = struct {
     bounds: math.Rect,
     uv: math.Rect,
@@ -106,10 +108,14 @@ pub const GlyphInstance = extern struct {
     uv: [4]f32,
     color: [4]f32,
 
-    pub fn fromGlyph(g: GlyphQuad) GlyphInstance {
+    /// 用图集**最终**宽高把像素 UV 归一化到 0..1。
+    /// 图集可能在本帧中途 grow，所以必须推迟到合批这一刻再做除法。
+    pub fn fromGlyph(g: GlyphQuad, atlas_size: ?math.Size) GlyphInstance {
+        const aw: f32 = if (atlas_size) |s| @max(1.0, s.width) else 1.0;
+        const ah: f32 = if (atlas_size) |s| @max(1.0, s.height) else 1.0;
         return .{
             .bounds = .{ g.bounds.x, g.bounds.y, g.bounds.width, g.bounds.height },
-            .uv = .{ g.uv.x, g.uv.y, g.uv.width, g.uv.height },
+            .uv = .{ g.uv.x / aw, g.uv.y / ah, g.uv.width / aw, g.uv.height / ah },
             .color = .{ g.color.r, g.color.g, g.color.b, g.color.a },
         };
     }
@@ -192,7 +198,10 @@ pub const DisplayList = struct {
     /// 按 Painter's Order 解析裁剪栈并合批：
     /// - 相邻、相同裁剪区、相同 kind 的图元合并成同一个 `DrawBatch`
     /// - Quad 与 Glyph 不能合批（管线/纹理不同），遇到 kind 切换必须切批
-    pub fn buildBatches(self: *const DisplayList, allocator: std.mem.Allocator) !BuiltBatches {
+    ///
+    /// `atlas_size`：本帧图集最终宽高（用于把 GlyphQuad 的像素 UV 归一化）。
+    /// 传 null 表示无图集场景（测试 / 无文字），UV 原样透传。
+    pub fn buildBatches(self: *const DisplayList, allocator: std.mem.Allocator, atlas_size: ?math.Size) !BuiltBatches {
         var quad_instances: std.ArrayList(QuadInstance) = .empty;
         errdefer quad_instances.deinit(allocator);
         var glyph_instances: std.ArrayList(GlyphInstance) = .empty;
@@ -231,7 +240,7 @@ pub const DisplayList = struct {
                         if (c.isEmpty()) continue;
                     }
                     const inst_idx: u32 = @intCast(glyph_instances.items.len);
-                    try glyph_instances.append(allocator, GlyphInstance.fromGlyph(g));
+                    try glyph_instances.append(allocator, GlyphInstance.fromGlyph(g, atlas_size));
                     try appendOrGrowBatch(&batches, allocator, .glyph, current_clip, inst_idx);
                 },
             }
@@ -459,7 +468,7 @@ test "DisplayList batches consecutive quads with same clip and preserves painter
     // Batch 2: 弹出裁剪后回到无裁剪，不能和 Batch 0 合并，因为要盖在 Batch 1 上面！
     try dl.pushQuad(.{ .bounds = math.Rect.init(5, 5, 20, 20), .background = math.Color.fromHex(0x00ff00) });
 
-    var built = try dl.buildBatches(gpa);
+    var built = try dl.buildBatches(gpa, null);
     defer built.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 4), built.quad_instances.len);
@@ -493,7 +502,7 @@ test "DisplayList splits batches when glyph and quad kinds alternate" {
     });
     try dl.pushQuad(.{ .bounds = math.Rect.init(22, 0, 10, 10), .background = math.Color.white });
 
-    var built = try dl.buildBatches(gpa);
+    var built = try dl.buildBatches(gpa, null);
     defer built.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 2), built.quad_instances.len);

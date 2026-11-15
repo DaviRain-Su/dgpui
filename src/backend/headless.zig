@@ -121,7 +121,11 @@ pub const HeadlessBackend = struct {
                 self.last_damage_rect = params.damage_rect;
                 if (params.display_list) |dl| {
                     self.last_command_count = dl.commands.items.len;
-                    var built = try dl.buildBatches(self.allocator);
+                    const atlas_size: ?math.Size = if (params.atlas_pixels != null and params.atlas_width > 0)
+                        .{ .width = @floatFromInt(params.atlas_width), .height = @floatFromInt(params.atlas_height) }
+                    else
+                        null;
+                    var built = try dl.buildBatches(self.allocator, atlas_size);
                     defer built.deinit(self.allocator);
                     self.last_batch_count = built.batches.len;
                     self.last_instance_count = built.quad_instances.len + built.glyph_instances.len;
