@@ -24,6 +24,7 @@ div().flexCol().p(16).gap(8).child(text("标题"))
 ## 3. 面试口径
 
 1. **AvailableSpace**：容器把 `definite / max_content` 往下传；文字叶子用 `measure(max_width)` 返回折行后尺寸。
-2. **grow/shrink**：主轴剩余空间按 `flex_grow` 分；不够则按 `flex_shrink * main_size` 加权压缩。
-3. **为什么节点在 FrameArena**：每帧重建轻量树，帧末 reset；持久状态（点击数）仍在 DemoState / 未来 EntityStore。
-4. **Chain DSL vs comptime/proc-macro**：链式 Builder 直观、易调试；编译期宏可做更强静态检查与依赖分析，但复杂度更高（PR 6 对比）。
+2. **显式宽度优先**：孩子若写了 `.w(480)`，measure 必须先用 480，而不是父级窗口宽度，否则折行高度会算错。
+3. **grow/shrink 后重测**：row 里文字被 shrink 变窄后，要按最终宽度再 `measure` 一次，高度才可能从 1 行变成 2 行。
+4. **为什么节点在 FrameArena**：每帧重建轻量树，帧末 reset；持久状态（点击数）仍在 DemoState / 未来 EntityStore。
+5. **Chain DSL vs comptime/proc-macro**：链式 Builder 直观、易调试；编译期宏可做更强静态检查与依赖分析，但复杂度更高（PR 6 对比）。
