@@ -245,8 +245,8 @@ const DemoState = struct {
         var content = (try dgpui.ui.div(frame_alloc)).flexCol().gap(8).w(420);
         var i: usize = 0;
         while (i < list.count) : (i += 1) {
-            var row_buf: [96]u8 = undefined;
-            const label = try std.fmt.bufPrint(&row_buf, "{d}. {s}", .{ i + 1, list.itemSlice(i) });
+            // 每个 label 必须拷到 FrameArena：textStyled 只存 slice，不能共用栈缓冲。
+            const label = try std.fmt.allocPrint(frame_alloc, "{d}. {s}", .{ i + 1, list.itemSlice(i) });
             var row = (try dgpui.ui.div(frame_alloc))
                 .flexRow()
                 .items(.center)
