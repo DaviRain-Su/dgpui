@@ -287,8 +287,16 @@ pub fn paintTreeHit(
 
     var my_hit: ?u32 = parent_hit;
     if (hits) |hl| {
-        // 只要有点击回调，或需要作为冒泡父节点，就登记 hitbox
-        if (elem.on_click != null or elem.children.items.len > 0 or elem.hit_tag != 0) {
+        // 登记条件：
+        // - 有 onClick / hitTag
+        // - 有孩子（作为冒泡父）
+        // - 本节点会画出可见几何（阻挡下层兄弟穿透点击，但仍可通过 parent 冒泡）
+        const paints_geometry = blk: {
+            if (elem.kind == .text and elem.text != null) break :blk true;
+            if (elem.kind == .box and (elem.background.a > 0 or elem.border_width > 0 or elem.shadow_color.a > 0)) break :blk true;
+            break :blk false;
+        };
+        if (elem.on_click != null or elem.children.items.len > 0 or elem.hit_tag != 0 or paints_geometry) {
             my_hit = try hl.push(.{
                 .bounds = bounds,
                 .clip = clip,
