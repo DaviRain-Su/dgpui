@@ -5,15 +5,22 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  ZIG_VERSION: 0.17.1
+
 jobs:
   linux-headless:
     # Linux 上没有现成 SDL3 包：只跑 headless 测试（text 栈照常链接）。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.17.1
+      # setup-zig 类 action 还在用旧的 tarball 命名（zig-linux-x86_64-*），
+      # 而 0.17 起官方命名是 zig-x86_64-linux-*，会 404 —— 直接从官方源下载。
+      - name: Install Zig
+        run: |
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar xf zig.tar.xz
+          echo "${{ github.workspace }}/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - name: Install text deps
         run: |
           sudo apt-get update
@@ -28,9 +35,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.17.1
+      - name: Install Zig
+        run: |
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          tar xf zig.tar.xz
+          echo "${{ github.workspace }}/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - name: Install SDL3 + text deps
         run: brew install sdl3 harfbuzz freetype pkg-config
       - name: Check formatting
