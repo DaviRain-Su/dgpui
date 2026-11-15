@@ -390,9 +390,13 @@ test "todo demo smoke: click focuses, typing drafts, Enter commits, wheel scroll
     try hb.pushEvent(.{ .text_input = platform.TextBytes.fromUtf8("买牛奶") });
     try hb.pushEvent(.{ .key_down = .{ .key = .enter, .repeat = false } });
     try hb.pushEvent(.{ .scroll = .{ .pos = .{ .x = 450, .y = 340 }, .dx = 0, .dy = -6 } });
-    try hb.pushEvent(.quit);
+    // 故意不 push .quit：quit 会置 running=false，让批次末尾的重绘被跳过。
+    // headless 队列排空后 waitEvent 返回 null，run() 自然退出。
 
     try loop.run();
+
+    // 交互批次里的多次 notify 合并成一次重绘：手动 drawOnce 1 帧 + 批次后 1 帧。
+    try std.testing.expectEqual(@as(usize, 2), hb.rendered_frames);
 
     const list: *TodoList = @ptrCast(@alignCast(state.entities.get(state.todos_id).?));
     // 8 条预置 + 1 条 "买牛奶"
