@@ -232,15 +232,6 @@ fn layoutChildren(node: *Node) void {
     if (node.style.height == .auto) {
         var content_main: f32 = 0;
         for (node.children, 0..) |child, i| {
-            content_main += if (dir == .row) child.height else child.height;
-            if (dir == .column) {
-                // column 主轴是 height
-            }
-            _ = i;
-        }
-        // 重新按方向汇总
-        content_main = 0;
-        for (node.children, 0..) |child, i| {
             content_main += if (dir == .row) child.width else child.height;
             if (i + 1 < n) content_main += node.style.gap;
         }
@@ -279,48 +270,72 @@ fn layoutChildren(node: *Node) void {
     } else if (free < -0.5) {
         // 多轮 shrink：权重始终按“本轮开始前的原始主轴尺寸”计算；
         // 某节点缩到 0 后冻结，剩余压缩量按原始权重比例继续分给其他节点。
-        var base_main: [64]f32 = undefined;
-        if (n > base_main.len) @panic("flex shrink: too many children for educational engine");
-        for (node.children, 0..) |child, i| {
-            base_main[i] = if (dir == .row) child.width else child.height;
-        }
-
-        var frozen: [64]bool = undefined;
-        @memset(&frozen, false);
-        var remaining = -free;
-        var guard: usize = 0;
-        while (remaining > 0.5 and guard < n + 2) : (guard += 1) {
+        //
+        // 教育版上限：固定栈缓冲最多 256 个孩子；超限退化为单轮按比例压缩
+        //（不冻结重分），打日志说明，绝不 panic —— 超长列表也要能布局。
+        // 另外整体限制：无 wrap / min-max / 百分比 / baseline / absolute。
+        const shrink_cap = 256;
+        if (n > shrink_cap) {
+            std.log.warn("flex: {d} children exceed multi-round shrink cap ({d}); using single-pass shrink", .{ n, shrink_cap });
             var weight_sum: f32 = 0;
-            for (node.children, 0..) |child, i| {
-                if (frozen[i]) continue;
+            for (node.children) |child| {
                 const main = if (dir == .row) child.width else child.height;
                 if (child.style.flex_shrink > 0 and main > 0) {
-                    weight_sum += child.style.flex_shrink * base_main[i];
-                } else if (main <= 0) {
-                    frozen[i] = true;
+                    weight_sum += child.style.flex_shrink * main;
                 }
             }
-            if (weight_sum <= 0) break;
-
-            var consumed: f32 = 0;
-            var hit_zero = false;
+            if (weight_sum > 0) {
+                const need = -free;
+                for (node.children) |child| {
+                    const main = if (dir == .row) child.width else child.height;
+                    if (!(child.style.flex_shrink > 0 and main > 0)) continue;
+                    const sub = @min(main, need * (child.style.flex_shrink * main / weight_sum));
+                    if (dir == .row) child.width = main - sub else child.height = main - sub;
+                }
+            }
+        } else {
+            var base_main: [shrink_cap]f32 = undefined;
             for (node.children, 0..) |child, i| {
-                if (frozen[i]) continue;
-                const main = if (dir == .row) child.width else child.height;
-                if (!(child.style.flex_shrink > 0 and main > 0)) continue;
-                const weighted = child.style.flex_shrink * base_main[i];
-                const ideal = remaining * (weighted / weight_sum);
-                const sub = @min(main, ideal);
-                if (dir == .row) child.width = main - sub else child.height = main - sub;
-                consumed += sub;
-                if (main - sub <= 0.0001) {
-                    frozen[i] = true;
-                    hit_zero = true;
-                }
+                base_main[i] = if (dir == .row) child.width else child.height;
             }
-            if (consumed <= 0.0001) break;
-            remaining -= consumed;
-            if (!hit_zero) break; // 没人触零，剩余按比例已分完
+
+            var frozen: [shrink_cap]bool = undefined;
+            @memset(&frozen, false);
+            var remaining = -free;
+            var guard: usize = 0;
+            while (remaining > 0.5 and guard < n + 2) : (guard += 1) {
+                var weight_sum: f32 = 0;
+                for (node.children, 0..) |child, i| {
+                    if (frozen[i]) continue;
+                    const main = if (dir == .row) child.width else child.height;
+                    if (child.style.flex_shrink > 0 and main > 0) {
+                        weight_sum += child.style.flex_shrink * base_main[i];
+                    } else if (main <= 0) {
+                        frozen[i] = true;
+                    }
+                }
+                if (weight_sum <= 0) break;
+
+                var consumed: f32 = 0;
+                var hit_zero = false;
+                for (node.children, 0..) |child, i| {
+                    if (frozen[i]) continue;
+                    const main = if (dir == .row) child.width else child.height;
+                    if (!(child.style.flex_shrink > 0 and main > 0)) continue;
+                    const weighted = child.style.flex_shrink * base_main[i];
+                    const ideal = remaining * (weighted / weight_sum);
+                    const sub = @min(main, ideal);
+                    if (dir == .row) child.width = main - sub else child.height = main - sub;
+                    consumed += sub;
+                    if (main - sub <= 0.0001) {
+                        frozen[i] = true;
+                        hit_zero = true;
+                    }
+                }
+                if (consumed <= 0.0001) break;
+                remaining -= consumed;
+                if (!hit_zero) break; // 没人触零，剩余按比例已分完
+            }
         }
     }
 

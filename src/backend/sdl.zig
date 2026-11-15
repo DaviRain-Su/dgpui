@@ -676,7 +676,11 @@ pub const SdlBackend = struct {
                 var built: ?scene.BuiltBatches = null;
                 defer if (built) |*b| b.deinit(self.allocator);
                 if (params.display_list) |dl| {
-                    built = try dl.buildBatches(self.allocator);
+                    const atlas_size: ?math.Size = if (params.atlas_pixels != null and params.atlas_width > 0)
+                        .{ .width = @floatFromInt(params.atlas_width), .height = @floatFromInt(params.atlas_height) }
+                    else
+                        null;
+                    built = try dl.buildBatches(self.allocator, atlas_size);
                     if (built.?.quad_instances.len > 0) {
                         try self.ensureQuadBuffers(built.?.quad_instances.len);
                     }

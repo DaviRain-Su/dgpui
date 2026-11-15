@@ -116,10 +116,13 @@ pub const AppLoop = struct {
             },
             .resized => |m| {
                 self.renderer_backend.resize(m.physicalWidth(), m.physicalHeight());
+                // 布局即将重算：清掉上一帧命中盒，避免缩放瞬间点中旧位置。
+                self.hit_list.clearRetainingCapacity();
                 self.needs_redraw = true;
             },
             .scale_changed => |m| {
                 self.renderer_backend.resize(m.physicalWidth(), m.physicalHeight());
+                self.hit_list.clearRetainingCapacity();
                 self.needs_redraw = true;
             },
             .redraw_requested => {
@@ -339,5 +342,6 @@ test "AppLoop resets FrameArena each frame and computes DamageRegion between fra
     try std.testing.expectEqual(@as(usize, 1), hb.last_batch_count);
     try std.testing.expectEqual(@as(usize, 2), hb.last_instance_count);
     // 第 2 帧只有 (50, 60, 120, 40) 变色了，背景没变，所以脏区精确等于按钮矩形
-    try std.testing.expectEqual(math.Rect.init(50, 60, 120, 40), hb.last_damage_rect.?);
+    // paintBounds 含 1px AA 外扩，脏区略大于按钮矩形本身
+    try std.testing.expectEqual(math.Rect.init(49, 59, 122, 42), hb.last_damage_rect.?);
 }

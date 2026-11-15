@@ -83,6 +83,25 @@ pub const GlyphAtlas = struct {
         self.dirty = true;
     }
 
+    /// 就地扩容：旧像素按原坐标拷贝，shelves / map 原样保留 ——
+    /// **所有旧 UV 依然有效**，同帧已准备的文本不会因扩容画错位置。
+    pub fn grow(self: *GlyphAtlas, new_w: u32, new_h: u32) AtlasError!void {
+        if (new_w <= self.width and new_h <= self.height) return;
+        const pixels = self.allocator.alloc(u8, @as(usize, new_w) * @as(usize, new_h)) catch return AtlasError.OutOfMemory;
+        @memset(pixels, 0);
+        var y: u32 = 0;
+        while (y < self.height) : (y += 1) {
+            const src_off: usize = @as(usize, y) * self.width;
+            const dst_off: usize = @as(usize, y) * new_w;
+            @memcpy(pixels[dst_off..][0..self.width], self.pixels[src_off..][0..self.width]);
+        }
+        self.allocator.free(self.pixels);
+        self.pixels = pixels;
+        self.width = new_w;
+        self.height = new_h;
+        self.dirty = true;
+    }
+
     fn keyHash(k: GlyphKey) u64 {
         return k.hash();
     }

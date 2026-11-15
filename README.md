@@ -1,5 +1,7 @@
 # dgpui — 用 Zig 做一个可理解的 mini-GPUI 框架
 
+[![CI](https://github.com/DaviRain-Su/dgpui/actions/workflows/ci.yml/badge.svg)](https://github.com/DaviRain-Su/dgpui/actions/workflows/ci.yml)
+
 > 一个为**系统/语言背景开发者**打造的教育型桌面 GUI 框架（Zig 0.17.1）。
 > 目标：不靠黑盒魔法，走通从 **DSL → 内存模型 → Flexbox 布局 → 文字排版 → 脏区与 Display List → GPU SDF 着色器 → 窗口与命中测试** 的完整闭环。
 
