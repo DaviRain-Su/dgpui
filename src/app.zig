@@ -144,7 +144,8 @@ pub const AppLoop = struct {
         }
     }
 
-    fn drawOnce(self: *AppLoop) !void {
+    /// 公开给测试 / 工具：手动画一帧（不进事件循环）。
+    pub fn drawOnce(self: *AppLoop) !void {
         self.needs_redraw = false;
         defer self.frame_arena.reset();
 

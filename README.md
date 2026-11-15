@@ -81,6 +81,7 @@
 - [GUI 框架大白话（`docs/gui-framework-plain.md`）](docs/gui-framework-plain.md) —— 面试前十分钟：五层各自干什么、代码做到哪、一帧怎么走。
 - [Rust GUI 框架面试映射表 (`docs/interview-map.md`)](docs/interview-map.md) —— 把 `dgpui` 的每一行代码翻译成 Rust / Slint / egui / Iced / 渲染管线面试术语。
 - [Monday 口述提纲（`docs/interview-qa.md`）](docs/interview-qa.md) —— 30 秒开场、高频追问、诚实边界、代码速查。
+- [一页作弊条（`docs/interview-cheatsheet.md`）](docs/interview-cheatsheet.md) —— 面试前 5 分钟过一遍。
 
 ---
 
