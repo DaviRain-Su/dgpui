@@ -98,20 +98,10 @@ pub const ShapeCache = struct {
     }
 
     /// 写入并**接管 glyphs 所有权**。满了就驱逐 LRU 最老的一条（原地覆盖）。
+    /// 先分配 key 再释放受害者：dupe 失败时缓存必须原样保留，不能出现指向
+    /// 已释放内存的条目。
     pub fn put(self: *ShapeCache, bytes: []const u8, pixel_size: u32, glyphs: []shaper.ShapedGlyph, width: f32) !*CacheEntry {
         const cap = @max(self.max_entries, 1);
-        var slot: ?usize = null;
-        if (self.entries.items.len >= cap) {
-            var oldest: usize = 0;
-            for (self.entries.items, 0..) |e, i| {
-                if (e.last_used < self.entries.items[oldest].last_used) oldest = i;
-            }
-            const victim = &self.entries.items[oldest];
-            self.allocator.free(victim.bytes);
-            self.allocator.free(victim.glyphs);
-            slot = oldest;
-        }
-
         const owned = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(owned);
         self.accesses += 1;
@@ -124,9 +114,17 @@ pub const ShapeCache = struct {
             .width = width,
             .last_used = self.accesses,
         };
-        if (slot) |i| {
-            self.entries.items[i] = entry;
-            return &self.entries.items[i];
+
+        if (self.entries.items.len >= cap) {
+            var oldest: usize = 0;
+            for (self.entries.items, 0..) |e, i| {
+                if (e.last_used < self.entries.items[oldest].last_used) oldest = i;
+            }
+            const victim = &self.entries.items[oldest];
+            self.allocator.free(victim.bytes);
+            self.allocator.free(victim.glyphs);
+            self.entries.items[oldest] = entry;
+            return &self.entries.items[oldest];
         }
         try self.entries.append(self.allocator, entry);
         return &self.entries.items[self.entries.items.len - 1];
@@ -171,8 +169,11 @@ pub const TextSystem = struct {
 
     /// shape（带缓存）：命中则零成本返回只读视图；未命中才走 HarfBuzz，
     /// 并把结果（glyphs 所有权）搬进缓存。返回的视图由缓存持有，调用方不释放。
+    /// 注意：命中也要恢复 FT face 字号 —— placeGlyphs/measure 随后会读
+    /// `ascenderPx/lineHeightPx`，而调用方可能刚用过别的字号（demo 混多种字号）。
     pub fn shapeCached(self: *TextSystem, utf8: []const u8, pixel_size: u32) !shaper.ShapedRunView {
         if (self.cache.find(utf8, pixel_size)) |e| {
+            try self.face.setPixelSize(pixel_size);
             return .{ .glyphs = e.glyphs, .width = e.width };
         }
         self.shape_calls += 1;
@@ -478,4 +479,24 @@ test "shape cache evicts least recently used entry" {
     _ = try sys.measureText("CCCC", 16, 1.0, null); // C 仍在 -> 命中
     try std.testing.expectEqual(@as(usize, 4), sys.shape_calls);
     try std.testing.expectEqual(@as(usize, 2), sys.cache.entries.items.len);
+}
+
+test "cache hits restore face metrics for mixed font sizes" {
+    const gpa = std.testing.allocator;
+    const path = font.defaultFontPath() orelse return error.SkipZigTest;
+    var sys: TextSystem = undefined;
+    try sys.init(gpa, path.ptr, 512, 512);
+    defer sys.deinit();
+
+    // 16 -> 24 -> 16：第二次 16 是缓存命中，但行高必须仍是 16px 的
+    const h16_first = (try sys.measureText("Hello 世界", 16, 1.0, null)).height;
+    const h24 = (try sys.measureText("Hello 世界", 24, 1.0, null)).height;
+    try std.testing.expect(h24 > h16_first);
+    const h16_again = (try sys.measureText("Hello 世界", 16, 1.0, null)).height; // 命中
+    try std.testing.expectEqual(h16_first, h16_again);
+
+    // paint 路径同理：命中后 placeGlyphs 读到的 ascent/lineHeight 必须属于 16px
+    var a = try sys.prepareLine("Hello 世界", .{ .x = 0, .y = 0 }, 16, 1.0, math.Color.white);
+    defer a.deinit(gpa);
+    try std.testing.expectApproxEqAbs(h16_first, a.size.height, 0.01);
 }
