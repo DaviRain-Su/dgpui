@@ -17,14 +17,14 @@
 - `src/scene.zig`：**与 GPU 无关的中间层 `DisplayList` & `DamageRegion`**
   - `Quad`：用逻辑像素描述矩形、圆角半径、边框、阴影。
   - `buildBatches`：按 **Painter's Order（先画的在底下，后画的盖上面）** 解析嵌套的 `pushClip / popClip`（矩形交集），把**连续且相同裁剪区**的 `Quad` 合并成一个 `QuadBatch`。
-  - `DamageRegion.fromDisplayListDiff`：对比上一帧和当前帧的命令列表，算出变化矩形（包含阴影外扩 `paintBounds`）的并集，即“脏区”。
+  - `DamageRegion.fromDisplayListDiff`：先把两帧展平为 `(quad, effective_clip)` 再对比，避免裁剪栈拓扑变化时漏掉“命令本身没变、可见区域变了”的脏区；并包含阴影外扩 `paintBounds`。
 - `src/shader/quad.metal`：**Metal SDF 着色器**
   - `quad_vs`：只画 6 个顶点（2 个三角形），直接从 Storage Buffer 读 `QuadInstance`，按 `shadow_blur` 自动外扩顶点包围盒，转换成 Metal NDC 坐标。
   - `quad_fs`：用 `sdfRoundedBox(p, half_size, radius)` 算每个像素离圆角边界的距离 `d`：
     - `d < 0`：矩形内部（填充色）；
     - `-border_width <= d <= 0`：边框；
     - `d > 0`：外部柔和衰减投影，或完全透明（角被“切”圆）。
-- `src/backend/sdl.zig`：一次 CopyPass 把整帧所有 `QuadInstance` 传进 GPU Storage Buffer，再逐批设置物理 `SDL_SetGPUScissor` 调用 `SDL_DrawGPUPrimitives`。
+- `src/backend/sdl.zig`：一次 CopyPass 把整帧所有 `QuadInstance` 传进 GPU Storage Buffer，再逐批设置物理 `SDL_SetGPUScissor` 调用 `SDL_DrawGPUPrimitives`。设备创建**只声明 `SDL_GPU_SHADERFORMAT_MSL`**（PR2 只内嵌 Metal 着色器）；若同时声明 SPIR-V，Vulkan 后端会被选中却拿不到对应着色器。
 
 ---
 

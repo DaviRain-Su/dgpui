@@ -137,7 +137,7 @@ pub const AppLoop = struct {
         }
 
         const damage: ?math.Rect = if (has_scene and self.prev_display_list != null)
-            scene.DamageRegion.fromDisplayListDiff(&self.prev_display_list.?, &self.display_list).rect
+            (try scene.DamageRegion.fromDisplayListDiff(self.allocator, &self.prev_display_list.?, &self.display_list)).rect
         else
             null;
 

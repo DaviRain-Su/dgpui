@@ -218,35 +218,79 @@ pub const DamageRegion = struct {
 
     /// 对比前后两帧 DisplayList，找出所有增删或属性变化命令的影响包围盒并集。
     /// 若完全一致则返回 null（无需重绘任何区域）。
-    pub fn fromDisplayListDiff(prev: *const DisplayList, next: *const DisplayList) DamageRegion {
-        var dmg = DamageRegion{};
-        const min_len = @min(prev.commands.items.len, next.commands.items.len);
+    ///
+    /// 关键：不能只按命令索引做 `eql`。裁剪栈拓扑变化时，同一个 Quad 命令可能
+    /// 仍出现在相同索引，但其有效裁剪区变了，可见像素会变化。因此先把两帧
+    /// 都展平为 `(quad, effective_clip)` 序列，再对比每条绘制的可见包围盒。
+    pub fn fromDisplayListDiff(
+        allocator: std.mem.Allocator,
+        prev: *const DisplayList,
+        next: *const DisplayList,
+    ) !DamageRegion {
+        const prev_items = try flattenPainted(prev, allocator);
+        defer allocator.free(prev_items);
+        const next_items = try flattenPainted(next, allocator);
+        defer allocator.free(next_items);
 
+        var dmg = DamageRegion{};
+        const min_len = @min(prev_items.len, next_items.len);
         for (0..min_len) |i| {
-            const a = prev.commands.items[i];
-            const b = next.commands.items[i];
-            if (!std.meta.eql(a, b)) {
-                mergeCommandBounds(&dmg, a);
-                mergeCommandBounds(&dmg, b);
+            const a = prev_items[i];
+            const b = next_items[i];
+            if (!Quad.eql(a.quad, b.quad) or !optRectEql(a.clip, b.clip)) {
+                dmg.merge(visibleBounds(a.quad, a.clip));
+                dmg.merge(visibleBounds(b.quad, b.clip));
             }
         }
-        for (min_len..prev.commands.items.len) |i| {
-            mergeCommandBounds(&dmg, prev.commands.items[i]);
+        for (min_len..prev_items.len) |i| {
+            dmg.merge(visibleBounds(prev_items[i].quad, prev_items[i].clip));
         }
-        for (min_len..next.commands.items.len) |i| {
-            mergeCommandBounds(&dmg, next.commands.items[i]);
+        for (min_len..next_items.len) |i| {
+            dmg.merge(visibleBounds(next_items[i].quad, next_items[i].clip));
         }
         return dmg;
     }
+};
 
-    fn mergeCommandBounds(dmg: *DamageRegion, cmd: DrawCommand) void {
+const PaintedItem = struct {
+    quad: Quad,
+    clip: ?math.Rect,
+};
+
+fn flattenPainted(dl: *const DisplayList, allocator: std.mem.Allocator) ![]PaintedItem {
+    var out: std.ArrayList(PaintedItem) = .empty;
+    errdefer out.deinit(allocator);
+    var clip_stack: std.ArrayList(math.Rect) = .empty;
+    defer clip_stack.deinit(allocator);
+
+    for (dl.commands.items) |cmd| {
         switch (cmd) {
-            .quad => |q| dmg.mergeQuad(q),
-            .push_clip => |r| dmg.merge(r),
-            .pop_clip => {},
+            .push_clip => |r| {
+                const effective = if (clip_stack.items.len > 0)
+                    clip_stack.items[clip_stack.items.len - 1].intersect(r)
+                else
+                    r;
+                try clip_stack.append(allocator, effective);
+            },
+            .pop_clip => {
+                if (clip_stack.items.len > 0) _ = clip_stack.pop();
+            },
+            .quad => |q| {
+                const clip: ?math.Rect = if (clip_stack.items.len > 0)
+                    clip_stack.items[clip_stack.items.len - 1]
+                else
+                    null;
+                try out.append(allocator, .{ .quad = q, .clip = clip });
+            },
         }
     }
-};
+    return out.toOwnedSlice(allocator);
+}
+
+fn visibleBounds(q: Quad, clip: ?math.Rect) math.Rect {
+    const pb = q.paintBounds();
+    return if (clip) |c| pb.intersect(c) else pb;
+}
 
 /// 计算某批次最终在物理像素上的裁剪矩形（将批裁剪区与可选脏区求交，再夹紧到帧缓冲范围）。
 /// 返回 null 表示不需要额外裁剪（整屏绘制）；返回 width==0 或 height==0 表示完全在可视区外可跳过绘制。
@@ -365,7 +409,7 @@ test "DamageRegion computes union of changed quads including shadow padding" {
     try next.pushQuad(static_bg);
     try next.pushQuad(btn_after);
 
-    const dmg = DamageRegion.fromDisplayListDiff(&prev, &next);
+    const dmg = try DamageRegion.fromDisplayListDiff(gpa, &prev, &next);
     try std.testing.expect(dmg.rect != null);
     // shadow_blur = 5 -> 外扩 pad = 10 -> (90, 90, 100, 52)，static_bg 没变不应被算进脏区
     try std.testing.expectEqual(@as(f32, 90), dmg.rect.?.x);
@@ -374,8 +418,40 @@ test "DamageRegion computes union of changed quads including shadow padding" {
     try std.testing.expectEqual(@as(f32, 52), dmg.rect.?.height);
 
     // 完全相同两帧的脏区为空
-    const same = DamageRegion.fromDisplayListDiff(&next, &next);
+    const same = try DamageRegion.fromDisplayListDiff(gpa, &next, &next);
     try std.testing.expectEqual(@as(?math.Rect, null), same.rect);
+}
+
+test "DamageRegion includes quads whose effective clip changes without command-index diffs" {
+    const gpa = std.testing.allocator;
+    var prev = DisplayList.init(gpa);
+    defer prev.deinit();
+    var next = DisplayList.init(gpa);
+    defer next.deinit();
+
+    const q = Quad{ .bounds = math.Rect.init(0, 0, 10, 10), .background = math.Color.white };
+    const r = Quad{ .bounds = math.Rect.init(100, 100, 20, 20), .background = math.Color.black };
+
+    // prev: push(A), Q, pop, push(B), R, pop  -> R clipped by B=(50,50,10,10) -> empty visible
+    try prev.pushClip(math.Rect.init(0, 0, 200, 200)); // A
+    try prev.pushQuad(q);
+    try prev.popClip();
+    try prev.pushClip(math.Rect.init(50, 50, 10, 10)); // B, disjoint from R
+    try prev.pushQuad(r);
+    try prev.popClip();
+
+    // next: push(A), Q, push(B), pop, R, pop -> R clipped by A, fully visible
+    try next.pushClip(math.Rect.init(0, 0, 200, 200)); // A
+    try next.pushQuad(q);
+    try next.pushClip(math.Rect.init(50, 50, 10, 10)); // B
+    try next.popClip();
+    try next.pushQuad(r);
+    try next.popClip();
+
+    const dmg = try DamageRegion.fromDisplayListDiff(gpa, &prev, &next);
+    try std.testing.expect(dmg.rect != null);
+    // R newly becomes visible under A; damage must cover R's bounds
+    try std.testing.expect(dmg.rect.?.contains(.{ .x = 110, .y = 110 }));
 }
 
 test "computePhysicalScissor intersects clip and damage and scales to framebuffer pixels" {

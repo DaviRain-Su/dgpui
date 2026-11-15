@@ -82,9 +82,12 @@ pub const SdlBackend = struct {
         // 这里按「窗口坐标 / 当前逻辑尺寸」把窗口放大，让逻辑尺寸回到请求值。
         adjustWindowToRequestedLogical(window, width, height);
 
-        // 在 macOS 下，SDL_GPU 会优先选择 Metal；也同时声明 SPIR-V/MSL 以便跨平台
+        // PR2 只内嵌了 Metal Shading Language（MSL）着色器。
+        // 设备创建时必须只声明我们真正能提供的格式：若同时声明 SPIR-V，
+        // Linux/Windows 上 SDL 会选 Vulkan，随后 CreateGPUShader(MSL) 直接失败。
+        // Vulkan/SPIR-V 着色器留给后续跨平台 PR。
         const gpu_device = c.SDL_CreateGPUDevice(
-            c.SDL_GPU_SHADERFORMAT_MSL | c.SDL_GPU_SHADERFORMAT_SPIRV,
+            c.SDL_GPU_SHADERFORMAT_MSL,
             true,
             null,
         ) orelse {
