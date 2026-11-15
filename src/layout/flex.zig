@@ -277,30 +277,50 @@ fn layoutChildren(node: *Node) void {
             }
         }
     } else if (free < -0.5) {
-        // 多轮 shrink：某节点缩到 0 后冻结，剩余压缩量继续分给其他可收缩节点。
+        // 多轮 shrink：权重始终按“本轮开始前的原始主轴尺寸”计算；
+        // 某节点缩到 0 后冻结，剩余压缩量按原始权重比例继续分给其他节点。
+        var base_main: [64]f32 = undefined;
+        if (n > base_main.len) @panic("flex shrink: too many children for educational engine");
+        for (node.children, 0..) |child, i| {
+            base_main[i] = if (dir == .row) child.width else child.height;
+        }
+
+        var frozen: [64]bool = undefined;
+        @memset(&frozen, false);
         var remaining = -free;
         var guard: usize = 0;
         while (remaining > 0.5 and guard < n + 2) : (guard += 1) {
             var weight_sum: f32 = 0;
-            for (node.children) |child| {
+            for (node.children, 0..) |child, i| {
+                if (frozen[i]) continue;
                 const main = if (dir == .row) child.width else child.height;
                 if (child.style.flex_shrink > 0 and main > 0) {
-                    weight_sum += child.style.flex_shrink * main;
+                    weight_sum += child.style.flex_shrink * base_main[i];
+                } else if (main <= 0) {
+                    frozen[i] = true;
                 }
             }
             if (weight_sum <= 0) break;
 
             var consumed: f32 = 0;
-            for (node.children) |child| {
+            var hit_zero = false;
+            for (node.children, 0..) |child, i| {
+                if (frozen[i]) continue;
                 const main = if (dir == .row) child.width else child.height;
                 if (!(child.style.flex_shrink > 0 and main > 0)) continue;
-                const weighted = child.style.flex_shrink * main;
-                const sub = @min(main, remaining * (weighted / weight_sum));
+                const weighted = child.style.flex_shrink * base_main[i];
+                const ideal = remaining * (weighted / weight_sum);
+                const sub = @min(main, ideal);
                 if (dir == .row) child.width = main - sub else child.height = main - sub;
                 consumed += sub;
+                if (main - sub <= 0.0001) {
+                    frozen[i] = true;
+                    hit_zero = true;
+                }
             }
             if (consumed <= 0.0001) break;
             remaining -= consumed;
+            if (!hit_zero) break; // 没人触零，剩余按比例已分完
         }
     }
 
@@ -515,14 +535,17 @@ test "row shrink remeasures wrapped text height" {
 test "shrink redistributes leftover after a child hits zero" {
     var a = Node{ .style = .{ .intrinsic = .{ .width = 10, .height = 10 }, .flex_shrink = 100 } };
     var b = Node{ .style = .{ .intrinsic = .{ .width = 100, .height = 10 }, .flex_shrink = 1 } };
-    const kids = [_]*Node{ &a, &b };
+    var c = Node{ .style = .{ .intrinsic = .{ .width = 100, .height = 10 }, .flex_shrink = 2 } };
+    const kids = [_]*Node{ &a, &b, &c };
     var root = Node{
         .style = .{ .direction = .row, .width = .{ .px = 50 }, .height = .{ .px = 10 }, .gap = 0 },
         .children = &kids,
     };
     layout(&root, .{ .width = 50, .height = 10 });
+    // a 先触零冻结；剩余按原始权重 100:200 分给 b/c => 50 与 0
     try std.testing.expectApproxEqAbs(@as(f32, 0), a.width, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 50), b.width, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), c.width, 0.01);
 }
 
 test "column flex_grow height is preserved after measure" {
