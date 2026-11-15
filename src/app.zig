@@ -133,7 +133,7 @@ pub const AppLoop = struct {
                     }
                 }
             },
-            // 其余输入事件留给回调。text_editing 只是翻译进了平台事件，循环本身还不画 IME。
+            // scroll / 键盘 / 文本输入留给回调（FocusManager / ScrollState）。
             .mouse_move, .mouse_up, .scroll, .key_down, .text_input, .text_editing => {},
         }
 

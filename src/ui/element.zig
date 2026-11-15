@@ -147,6 +147,11 @@ pub const ElementBuilder = struct {
         return self;
     }
 
+    pub fn childElem(self: ElementBuilder, other: *Element) !ElementBuilder {
+        try self.elem.children.append(self.allocator, other);
+        return self;
+    }
+
     pub fn finish(self: ElementBuilder) *Element {
         return self.elem;
     }
