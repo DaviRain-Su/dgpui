@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux-headless:
+    # Linux 上没有现成 SDL3 包：只跑 headless 测试（text 栈照常链接）。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.1
+      - name: Install text deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libharfbuzz-dev libfreetype-dev
+      - name: Check formatting
+        run: zig fmt --check .
+      - name: Headless tests
+        run: zig build -Dsdl=false test
+
+  macos-full:
+    # macOS 上通过 brew 装 SDL3，完整跑 headless 测试 + 编译 SDL/Metal demo。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.1
+      - name: Install SDL3 + text deps
+        run: brew install sdl3 harfbuzz freetype pkg-config
+      - name: Check formatting
+        run: zig fmt --check .
+      - name: Tests (headless + SDL demo build)
+        run: zig build test
+      - name: Build demo
+        run: zig build

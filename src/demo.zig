@@ -73,6 +73,8 @@ pub const DemoState = struct {
         self.entities = entity.EntityStore.init(gpa);
         self.todos_id = try self.entities.insert(&self.todos);
         try self.entities.observe(self.todos_id, self.view_key);
+        // 焦点管理挂上 EntityStore：派发前校验实体存活，防悬垂 handler
+        self.focus = input.FocusManager.init(&self.entities);
 
         // 预置几条，方便演示滚动
         const seeds = [_][]const u8{
@@ -301,7 +303,9 @@ pub const DemoState = struct {
         const header_elem = header.finish();
         try ui.layoutTree(header_elem, .{ .width = 420, .height = 200 }, frame_alloc, DemoState.measureText, self);
 
-        // 外层卡片背景
+        // 外层卡片背景：直接 pushQuad（没走 DSL 树）。教学取舍：滚动视口需要手动
+        // 计算位置画 clip+offset，为保持 demo 简洁把静态背景也手画了；
+        // 真实框架会用带 overflow 的容器组件统一这件事。
         try dl.pushQuad(.{
             .bounds = math.Rect.init((metrics.logical_width - 480) * 0.5, 40, 480, 560),
             .background = math.Color.fromHex(0x24273a),

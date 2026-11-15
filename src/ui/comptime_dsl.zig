@@ -29,6 +29,10 @@ pub const CompNode = struct {
 };
 
 /// 声明式描述：编译期展开成 CompNode 表。
+///
+/// ⚠️ 刻意的教育简化：`child_start/child_end` 假定「孩子紧随父节点存放在表中」，
+/// 因此只能表达**静态树形**，表达不了变长列表 / 条件分支 —— 这正是链式 DSL
+/// 作为主路径的原因（本文件是对比样本，不是替代品）。
 pub fn describeCounterCard() []const CompNode {
     // 手工模拟宏展开后的静态表：root(column) -> title, body, counter
     const table = [_]CompNode{

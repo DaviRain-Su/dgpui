@@ -20,11 +20,14 @@ pub const PreparedGlyph = struct {
 
 pub const PreparedText = struct {
     glyphs: []PreparedGlyph,
+    /// 完整分配。`glyphs` 可能是它的前缀（图集满时放不下的字形被跳过不绘制）；
+    /// deinit 释放这份完整分配 —— free 必须与 alloc 完全匹配。
+    alloc: []PreparedGlyph,
     /// 逻辑像素下的整行宽高
     size: math.Size,
 
     pub fn deinit(self: *PreparedText, allocator: std.mem.Allocator) void {
-        allocator.free(self.glyphs);
+        allocator.free(self.alloc);
         self.* = undefined;
     }
 };
@@ -57,6 +60,109 @@ pub const TextSystem = struct {
         self.* = undefined;
     }
 
+    const PlaceOptions = struct {
+        origin: math.Point,
+        pixel_size: u32,
+        scale: f32,
+        color: math.Color,
+        /// null = 单行不折行；有值 = 按 max_width（逻辑像素）贪心折行
+        max_width_logical: ?f32,
+    };
+
+    /// 统一的字形摆放核心：单行（prepareLine）与折行（prepareWrapped）共用。
+    ///
+    /// 图集满时的恢复策略：
+    /// 1. 第一次撞满 → `atlas.clear()` 后**从头重排整个 run**。已放置字形的 UV
+    ///    会因 clear 作废，绝不能和新 UV 混用，所以必须整轮重来。
+    /// 2. 重排后再撞满（或 OOM）→ 逐个跳过放不下的字形，本帧继续，绝不让
+    ///    一帧绘制整体失败。
+    /// 教育取舍：真实框架会做图集扩容 / LRU 淘汰，这里用 clear 换实现简单。
+    fn placeGlyphs(self: *TextSystem, run: shaper.ShapedRun, opts: PlaceOptions) !PreparedText {
+        const inv_scale = 1.0 / opts.scale;
+        const ascent = self.face.ascenderPx() * inv_scale;
+        const line_height = self.face.lineHeightPx() * inv_scale;
+        const max_w_phys: ?f32 = if (opts.max_width_logical) |w| w * opts.scale else null;
+
+        var glyphs = try self.allocator.alloc(PreparedGlyph, run.glyphs.len);
+        errdefer self.allocator.free(glyphs);
+
+        var restarts: usize = 0;
+        while (true) {
+            var out_i: usize = 0;
+            var pen_x: f32 = 0;
+            var pen_y: f32 = 0;
+            var line_index: f32 = 0;
+            var max_line_w: f32 = 0;
+            var need_restart = false;
+
+            for (run.glyphs) |g| {
+                if (max_w_phys) |mw| {
+                    if (pen_x > 0 and pen_x + g.x_advance > mw) {
+                        max_line_w = @max(max_line_w, pen_x);
+                        pen_x = 0;
+                        line_index += 1;
+                    }
+                }
+
+                var placed: ?atlas.GlyphUv = null;
+                if (self.atlas.getOrRasterize(&self.face, g.glyph_id, opts.pixel_size)) |uv| {
+                    placed = uv;
+                } else |err| {
+                    if (err == atlas.AtlasError.AtlasFull and restarts < 1) {
+                        std.log.warn("glyph atlas full ({d}x{d}), clearing glyph cache and re-placing run", .{ self.atlas.width, self.atlas.height });
+                        self.atlas.clear();
+                        restarts += 1;
+                        need_restart = true;
+                    }
+                    // 重启后仍放不下 / OOM：跳过该字形（不绘制），pen 照常前进
+                }
+                if (need_restart) break;
+
+                if (placed) |uv_px| {
+                    // FreeType bearing：bitmap 相对 pen 的偏移（物理像素）
+                    const gx_phys = pen_x + g.x_offset + @as(f32, @floatFromInt(uv_px.bearing_x));
+                    const gy_phys = pen_y - g.y_offset - @as(f32, @floatFromInt(uv_px.bearing_y));
+
+                    const bounds = math.Rect{
+                        .x = opts.origin.x + gx_phys * inv_scale,
+                        .y = opts.origin.y + line_index * line_height + gy_phys * inv_scale + ascent,
+                        .width = @as(f32, @floatFromInt(uv_px.width)) * inv_scale,
+                        .height = @as(f32, @floatFromInt(uv_px.height)) * inv_scale,
+                    };
+
+                    const aw: f32 = @floatFromInt(self.atlas.width);
+                    const ah: f32 = @floatFromInt(self.atlas.height);
+                    const uv_left = @as(f32, @floatFromInt(uv_px.x)) / aw;
+                    const uv_top = @as(f32, @floatFromInt(uv_px.y)) / ah;
+                    const uv_right = @as(f32, @floatFromInt(uv_px.x + uv_px.width)) / aw;
+                    const uv_bottom = @as(f32, @floatFromInt(uv_px.y + uv_px.height)) / ah;
+
+                    glyphs[out_i] = .{
+                        .bounds = bounds,
+                        .uv = math.Rect.init(uv_left, uv_top, uv_right - uv_left, uv_bottom - uv_top),
+                        .color = opts.color,
+                    };
+                    out_i += 1;
+                }
+
+                pen_x += g.x_advance;
+                pen_y += g.y_advance;
+            }
+
+            if (!need_restart) {
+                max_line_w = @max(max_line_w, pen_x);
+                return .{
+                    .glyphs = glyphs[0..out_i],
+                    .alloc = glyphs,
+                    .size = .{
+                        .width = max_line_w * inv_scale,
+                        .height = (line_index + 1.0) * line_height,
+                    },
+                };
+            }
+        }
+    }
+
     /// 布局一行文字。
     /// `logical_px` = UI 字号；`scale` = content/DPI scale；物理字号 = round(logical_px * scale)。
     pub fn prepareLine(
@@ -73,52 +179,13 @@ pub const TextSystem = struct {
         var run = try self.shaper_state.shape(utf8);
         defer run.deinit(self.allocator);
 
-        var glyphs = try self.allocator.alloc(PreparedGlyph, run.glyphs.len);
-        errdefer self.allocator.free(glyphs);
-
-        const inv_scale = 1.0 / scale;
-        var pen_x: f32 = 0;
-        var pen_y: f32 = 0;
-        const max_ascent: f32 = self.face.ascenderPx() * inv_scale;
-        const max_descent: f32 = -self.face.descenderPx() * inv_scale;
-
-        for (run.glyphs, 0..) |g, i| {
-            const uv_px = try self.atlas.getOrRasterize(&self.face, g.glyph_id, pixel_size);
-
-            // FreeType bearing：bitmap 相对 pen 的偏移（物理像素）
-            const gx_phys = pen_x + g.x_offset + @as(f32, @floatFromInt(uv_px.bearing_x));
-            const gy_phys = pen_y - g.y_offset - @as(f32, @floatFromInt(uv_px.bearing_y));
-
-            const bounds = math.Rect{
-                .x = origin_logical.x + gx_phys * inv_scale,
-                .y = origin_logical.y + gy_phys * inv_scale + max_ascent,
-                .width = @as(f32, @floatFromInt(uv_px.width)) * inv_scale,
-                .height = @as(f32, @floatFromInt(uv_px.height)) * inv_scale,
-            };
-
-            const uv_left = @as(f32, @floatFromInt(uv_px.x)) / @as(f32, @floatFromInt(self.atlas.width));
-            const uv_top = @as(f32, @floatFromInt(uv_px.y)) / @as(f32, @floatFromInt(self.atlas.height));
-            const uv_right = @as(f32, @floatFromInt(uv_px.x + uv_px.width)) / @as(f32, @floatFromInt(self.atlas.width));
-            const uv_bottom = @as(f32, @floatFromInt(uv_px.y + uv_px.height)) / @as(f32, @floatFromInt(self.atlas.height));
-
-            glyphs[i] = .{
-                .bounds = bounds,
-                .uv = math.Rect.init(uv_left, uv_top, uv_right - uv_left, uv_bottom - uv_top),
-                .color = color,
-            };
-
-            pen_x += g.x_advance;
-            pen_y += g.y_advance;
-        }
-
-        _ = max_descent;
-        return .{
-            .glyphs = glyphs,
-            .size = .{
-                .width = run.width * inv_scale,
-                .height = self.face.lineHeightPx() * inv_scale,
-            },
-        };
+        return self.placeGlyphs(run, .{
+            .origin = origin_logical,
+            .pixel_size = pixel_size,
+            .scale = scale,
+            .color = color,
+            .max_width_logical = null,
+        });
     }
 
     /// 给 Flex `measure` 用：按 max_width（逻辑像素）做简单贪心折行，返回包围盒。
@@ -173,60 +240,32 @@ pub const TextSystem = struct {
         var run = try self.shaper_state.shape(utf8);
         defer run.deinit(self.allocator);
 
-        var glyphs = try self.allocator.alloc(PreparedGlyph, run.glyphs.len);
-        errdefer self.allocator.free(glyphs);
-
-        const inv_scale = 1.0 / scale;
-        const ascent = self.face.ascenderPx() * inv_scale;
-        const line_height = self.face.lineHeightPx() * inv_scale;
-        const max_w_phys = max_width_logical * scale;
-
-        var pen_x: f32 = 0;
-        var line_index: f32 = 0;
-        var max_line_w: f32 = 0;
-        var out_i: usize = 0;
-
-        for (run.glyphs) |g| {
-            if (pen_x > 0 and pen_x + g.x_advance > max_w_phys) {
-                max_line_w = @max(max_line_w, pen_x);
-                pen_x = 0;
-                line_index += 1;
-            }
-
-            const uv_px = try self.atlas.getOrRasterize(&self.face, g.glyph_id, pixel_size);
-            const gx_phys = pen_x + g.x_offset + @as(f32, @floatFromInt(uv_px.bearing_x));
-            const gy_phys = -g.y_offset - @as(f32, @floatFromInt(uv_px.bearing_y));
-
-            const bounds = math.Rect{
-                .x = origin_logical.x + gx_phys * inv_scale,
-                .y = origin_logical.y + line_index * line_height + gy_phys * inv_scale + ascent,
-                .width = @as(f32, @floatFromInt(uv_px.width)) * inv_scale,
-                .height = @as(f32, @floatFromInt(uv_px.height)) * inv_scale,
-            };
-            const uv_left = @as(f32, @floatFromInt(uv_px.x)) / @as(f32, @floatFromInt(self.atlas.width));
-            const uv_top = @as(f32, @floatFromInt(uv_px.y)) / @as(f32, @floatFromInt(self.atlas.height));
-            const uv_right = @as(f32, @floatFromInt(uv_px.x + uv_px.width)) / @as(f32, @floatFromInt(self.atlas.width));
-            const uv_bottom = @as(f32, @floatFromInt(uv_px.y + uv_px.height)) / @as(f32, @floatFromInt(self.atlas.height));
-
-            glyphs[out_i] = .{
-                .bounds = bounds,
-                .uv = math.Rect.init(uv_left, uv_top, uv_right - uv_left, uv_bottom - uv_top),
-                .color = color,
-            };
-            out_i += 1;
-            pen_x += g.x_advance;
-        }
-        max_line_w = @max(max_line_w, pen_x);
-
-        return .{
-            .glyphs = glyphs[0..out_i],
-            .size = .{
-                .width = max_line_w * inv_scale,
-                .height = (line_index + 1.0) * line_height,
-            },
-        };
+        return self.placeGlyphs(run, .{
+            .origin = origin_logical,
+            .pixel_size = pixel_size,
+            .scale = scale,
+            .color = color,
+            .max_width_logical = max_width_logical,
+        });
     }
 };
+
+test "atlas-full recovers by clearing instead of failing the frame" {
+    const gpa = std.testing.allocator;
+    const path = font.defaultFontPath() orelse return error.SkipZigTest;
+    var sys: TextSystem = undefined;
+    // 故意用极小图集：16px 字形（加 1px padding）放不进 8x8，
+    // 只有空格这类空字形（1x1）能进 —— 触发一次 clear 重排。
+    try sys.init(gpa, path.ptr, 8, 8);
+    defer sys.deinit();
+
+    // 关键契约：返回成功（不冒泡 AtlasFull），放不下的字形被逐个跳过
+    var prepared = try sys.prepareLine("Hello 世界", .{ .x = 0, .y = 0 }, 16, 1.0, math.Color.white);
+    defer prepared.deinit(gpa);
+    try std.testing.expect(prepared.glyphs.len < 7);
+    // 重排后留下的字形必须和图集条目一一对应（clear 作废的 UV 不允许残留）
+    try std.testing.expectEqual(prepared.glyphs.len, sys.atlas.map.count());
+}
 
 test "TextSystem shapes Latin and CJK and fills glyph atlas" {
     const gpa = std.testing.allocator;

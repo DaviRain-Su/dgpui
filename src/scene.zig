@@ -21,12 +21,15 @@ pub const Quad = struct {
     shadow_blur: f32 = 0,
     shadow_offset: math.Point = .{},
 
-    /// 包含阴影外扩在内的真实覆盖包围盒（用于脏区计算和 GPU 展开四边形）
+    /// 包含阴影外扩与抗锯齿边距在内的真实覆盖包围盒（用于脏区计算和 GPU 展开四边形）。
+    /// GPU 端（quad.metal）即使无阴影也至少外扩 1px 做 AA；CPU 侧脏区必须 >= GPU 覆盖，
+    /// 否则将来接 LOADOP_LOAD 增量重绘时边缘会留 1px 残影。
     pub fn paintBounds(self: Quad) math.Rect {
-        const pad = if (self.shadow_color.a > 0 and self.shadow_blur > 0)
+        const shadow_pad = if (self.shadow_color.a > 0 and self.shadow_blur > 0)
             self.shadow_blur * 2.0 + @max(@abs(self.shadow_offset.x), @abs(self.shadow_offset.y))
         else
             0;
+        const pad = @max(shadow_pad, 1.0);
         return .{
             .x = self.bounds.x - pad,
             .y = self.bounds.y - pad,
