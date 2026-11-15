@@ -8,7 +8,10 @@ const DemoState = struct {
     text_ready: bool = false,
 
     fn setupText(self: *DemoState, gpa: std.mem.Allocator) !void {
-        const path = dgpui.text.font.defaultFontPath();
+        const path = dgpui.text.font.defaultFontPath() orelse {
+            std.log.err("no system font found for demo text", .{});
+            return error.FontNotFound;
+        };
         try self.text_system.init(gpa, path.ptr, 1024, 1024);
         self.text_ready = true;
     }

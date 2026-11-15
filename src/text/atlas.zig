@@ -139,6 +139,10 @@ pub const GlyphAtlas = struct {
             }
         }
 
+        // 比图集还宽的字形：现有 shelf 分支已经拒了，新开 shelf 也必须先拒，
+        // 否则后面按 bmp.width 拷贝会写出边界。
+        if (need_w > self.width) return AtlasError.AtlasFull;
+
         const y: u32 = if (self.shelves.items.len == 0)
             0
         else blk: {
@@ -171,4 +175,6 @@ test "shelf atlas packs glyphs without overlap" {
     }
     const c = try atlas.allocShelf(10, 10);
     try std.testing.expect(c.y > 0);
+
+    try std.testing.expectError(AtlasError.AtlasFull, atlas.allocShelf(80, 10));
 }

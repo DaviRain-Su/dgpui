@@ -759,6 +759,7 @@ pub const SdlBackend = struct {
                                                     &.{ .texture = self.atlas_texture.?, .mip_level = 0, .layer = 0, .x = 0, .y = 0, .z = 0, .w = params.atlas_width, .h = params.atlas_height, .d = 1 },
                                                     false,
                                                 );
+                                                if (params.atlas_uploaded) |flag| flag.* = true;
                                             }
                                         }
                                     }

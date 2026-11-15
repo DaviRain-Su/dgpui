@@ -166,6 +166,7 @@ pub const AppLoop = struct {
             }
         }
 
+        var atlas_uploaded = false;
         try self.renderer_backend.renderFrame(.{
             .logical_size = m.logicalSize(),
             .scale_factor = m.scale_factor,
@@ -176,9 +177,12 @@ pub const AppLoop = struct {
             .atlas_width = atlas_w,
             .atlas_height = atlas_h,
             .atlas_dirty = atlas_dirty,
+            .atlas_uploaded = &atlas_uploaded,
         });
 
-        if (atlas_dirty) {
+        // 只有渲染后端确认本帧真的上传了图集，才清 CPU dirty。
+        // 否则（例如 swapchain acquire 失败）下一帧还要带着 dirty 重试。
+        if (atlas_dirty and atlas_uploaded) {
             if (self.callbacks) |cb| {
                 if (cb.atlasClearDirty) |f| f(cb.ctx);
             }

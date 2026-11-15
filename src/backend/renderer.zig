@@ -23,6 +23,9 @@ pub const FrameParams = struct {
     atlas_width: u32 = 0,
     atlas_height: u32 = 0,
     atlas_dirty: bool = false,
+    /// 输出：本帧是否真的把脏图集上传到了 GPU。
+    /// AppLoop 只有在这里被置 true 后才清 CPU 侧 dirty，避免 acquire 失败时丢上传。
+    atlas_uploaded: ?*bool = null,
 };
 
 pub const RendererBackend = struct {

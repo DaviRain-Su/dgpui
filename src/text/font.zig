@@ -106,19 +106,25 @@ pub const FontFace = struct {
     }
 };
 
-pub fn defaultFontPath() [:0]const u8 {
-    // macOS：优先 Arial（覆盖拉丁文），中文混排时 HarfBuzz/系统字体回退会另说；
-    // PR3 先用 Arial Unicode / Hiragino 做中英混排演示。
-    if (fileExistsZ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf")) {
-        return "/System/Library/Fonts/Supplemental/Arial Unicode.ttf";
+pub fn defaultFontPath() ?[:0]const u8 {
+    // 跨平台探测：测试机 / Demo 都走这里。找不到就返回 null，由调用方决定 skip / 报错。
+    const candidates = [_][:0]const u8{
+        // macOS
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        // Linux 常见发行版路径
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    };
+    for (candidates) |path| {
+        if (fileExistsZ(path)) return path;
     }
-    if (fileExistsZ("/System/Library/Fonts/Supplemental/Arial.ttf")) {
-        return "/System/Library/Fonts/Supplemental/Arial.ttf";
-    }
-    if (fileExistsZ("/System/Library/Fonts/Hiragino Sans GB.ttc")) {
-        return "/System/Library/Fonts/Hiragino Sans GB.ttc";
-    }
-    return "/System/Library/Fonts/Supplemental/Arial.ttf";
+    return null;
 }
 
 fn fileExistsZ(path: [:0]const u8) bool {

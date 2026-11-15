@@ -130,6 +130,10 @@ pub const HeadlessBackend = struct {
                     self.last_batch_count = 0;
                     self.last_instance_count = 0;
                 }
+                // Headless 没有真实 GPU；若本帧声明了脏图集，视为“已消费/已上传”。
+                if (params.atlas_dirty) {
+                    if (params.atlas_uploaded) |flag| flag.* = true;
+                }
             }
         }.call,
         .resize = struct {
