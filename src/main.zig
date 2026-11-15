@@ -6,6 +6,7 @@ const DemoState = struct {
     accent_on: bool = false,
     text_system: dgpui.text.TextSystem = undefined,
     text_ready: bool = false,
+    scale: f32 = 1,
 
     fn setupText(self: *DemoState, gpa: std.mem.Allocator) !void {
         const path = dgpui.text.font.defaultFontPath() orelse {
@@ -37,100 +38,100 @@ const DemoState = struct {
         }
     }
 
+    fn measureText(
+        ctx: ?*anyopaque,
+        bytes: []const u8,
+        font_size: f32,
+        max_width: dgpui.layout.AvailableSpace,
+    ) dgpui.math.Size {
+        const self: *DemoState = @ptrCast(@alignCast(ctx.?));
+        if (!self.text_ready) {
+            return .{ .width = @as(f32, @floatFromInt(bytes.len)) * font_size * 0.5, .height = font_size * 1.25 };
+        }
+        const mw: ?f32 = switch (max_width) {
+            .definite => |v| v,
+            .max_content => null,
+        };
+        return self.text_system.measureText(bytes, font_size, self.scale, mw) catch .{
+            .width = @as(f32, @floatFromInt(bytes.len)) * font_size * 0.5,
+            .height = font_size * 1.25,
+        };
+    }
+
+    fn paintText(
+        ctx: ?*anyopaque,
+        dl: *dgpui.scene.DisplayList,
+        text: dgpui.ui.element.TextContent,
+        origin: dgpui.math.Point,
+        max_width: f32,
+    ) !void {
+        const self: *DemoState = @ptrCast(@alignCast(ctx.?));
+        if (!self.text_ready) return;
+        var prepared = try self.text_system.prepareWrapped(
+            text.bytes,
+            origin,
+            text.font_size,
+            self.scale,
+            max_width,
+            text.color,
+        );
+        defer prepared.deinit(self.text_system.allocator);
+        for (prepared.glyphs) |g| {
+            try dl.pushGlyph(.{ .bounds = g.bounds, .uv = g.uv, .color = g.color });
+        }
+    }
+
     fn onRender(
         ctx: *anyopaque,
         dl: *dgpui.scene.DisplayList,
-        _: std.mem.Allocator,
+        frame_alloc: std.mem.Allocator,
         metrics: dgpui.backend.platform.WindowMetrics,
     ) !void {
         const self: *DemoState = @ptrCast(@alignCast(ctx));
+        self.scale = metrics.scale_factor;
 
-        const card_w: f32 = @min(460.0, @max(240.0, metrics.logical_width - 64.0));
-        const card_h: f32 = 280.0;
-        const card_x = (metrics.logical_width - card_w) * 0.5;
-        const card_y = (metrics.logical_height - card_h) * 0.5;
+        const accent = dgpui.math.Color.fromHex(if (self.accent_on) 0xa6da95 else 0x8aadf4);
+        const title_color = dgpui.math.Color.fromHex(0xcad3f5);
+        const body_color = dgpui.math.Color.fromHex(0xa5adce);
 
-        try dl.pushQuad(.{
-            .bounds = dgpui.math.Rect.init(card_x, card_y, card_w, card_h),
-            .background = dgpui.math.Color.fromHex(0x24273a),
-            .border_color = dgpui.math.Color.fromHex(if (self.accent_on) 0x8aadf4 else 0x494d64),
-            .border_width = 1.5,
-            .corner_radius = 16.0,
-            .shadow_color = dgpui.math.Color.fromHexRgba(0x00000090),
-            .shadow_blur = 20.0,
-            .shadow_offset = .{ .x = 0, .y = 8 },
-        });
+        var counter_buf: [64]u8 = undefined;
+        const counter_text = try std.fmt.bufPrint(&counter_buf, "clicks = {d}", .{self.clicks});
+        const card_w: f32 = @min(480.0, @max(280.0, metrics.logical_width - 64.0));
 
-        if (self.text_ready) {
-            const title_color = dgpui.math.Color.fromHex(0xcad3f5);
-            const body_color = dgpui.math.Color.fromHex(0xa5adce);
-            const accent = dgpui.math.Color.fromHex(if (self.accent_on) 0xa6da95 else 0x8aadf4);
+        // GPUI 风格链式 DSL：布局由 Flex 引擎算，不再手写绝对 x/y。
+        var tags = (try dgpui.ui.div(frame_alloc)).flexRow().gap(10);
+        tags = try tags.child((try dgpui.ui.div(frame_alloc)).bg(dgpui.math.Color.fromHex(0x363a4f)).rounded(17).w(88).h(34));
+        tags = try tags.child((try dgpui.ui.div(frame_alloc)).bg(dgpui.math.Color.fromHex(0x363a4f)).rounded(17).w(72).h(34));
+        tags = try tags.child((try dgpui.ui.div(frame_alloc)).bg(accent).rounded(10).grow(1).h(34));
 
-            var title = try self.text_system.prepareLine(
-                "dgpui · Text Shaping",
-                .{ .x = card_x + 24, .y = card_y + 22 },
-                22,
-                metrics.scale_factor,
-                title_color,
-            );
-            defer title.deinit(self.text_system.allocator);
-            for (title.glyphs) |g| try dl.pushGlyph(.{ .bounds = g.bounds, .uv = g.uv, .color = g.color });
+        var card = (try dgpui.ui.div(frame_alloc))
+            .flexCol()
+            .gap(12)
+            .p(24)
+            .w(card_w)
+            .bg(dgpui.math.Color.fromHex(0x24273a))
+            .border(dgpui.math.Color.fromHex(if (self.accent_on) 0x8aadf4 else 0x494d64), 1.5)
+            .rounded(16)
+            .shadow(dgpui.math.Color.fromHexRgba(0x00000090), 20, .{ .x = 0, .y = 8 });
+        card = try card.child(try dgpui.ui.textStyled(frame_alloc, "dgpui · DSL + Flex", 22, title_color));
+        card = try card.child(try dgpui.ui.textStyled(frame_alloc, "HarfBuzz measure_text drives wrapping height", 14, body_color));
+        card = try card.child(try dgpui.ui.textStyled(frame_alloc, "Hello 世界 · 窗口变窄时这段字会自动折行并撑高卡片", 16, accent));
+        card = try card.child(try dgpui.ui.textStyled(frame_alloc, counter_text, 18, title_color));
+        card = try card.child(tags);
 
-            var body = try self.text_system.prepareLine(
-                "HarfBuzz + FreeType + GlyphAtlas",
-                .{ .x = card_x + 24, .y = card_y + 58 },
-                15,
-                metrics.scale_factor,
-                body_color,
-            );
-            defer body.deinit(self.text_system.allocator);
-            for (body.glyphs) |g| try dl.pushGlyph(.{ .bounds = g.bounds, .uv = g.uv, .color = g.color });
+        var root = (try dgpui.ui.div(frame_alloc))
+            .flexCol()
+            .items(.center)
+            .justify(.center)
+            .w(metrics.logical_width)
+            .h(metrics.logical_height);
+        root = try root.child(card);
 
-            var mixed = try self.text_system.prepareLine(
-                "Hello 世界 · 点击切换高亮",
-                .{ .x = card_x + 24, .y = card_y + 90 },
-                16,
-                metrics.scale_factor,
-                accent,
-            );
-            defer mixed.deinit(self.text_system.allocator);
-            for (mixed.glyphs) |g| try dl.pushGlyph(.{ .bounds = g.bounds, .uv = g.uv, .color = g.color });
+        const root_elem = root.finish();
+        try dgpui.ui.layoutTree(root_elem, metrics.logicalSize(), frame_alloc, DemoState.measureText, self);
 
-            var counter_buf: [64]u8 = undefined;
-            const counter_text = try std.fmt.bufPrint(&counter_buf, "clicks = {d}", .{self.clicks});
-            var counter = try self.text_system.prepareLine(
-                counter_text,
-                .{ .x = card_x + 24, .y = card_y + 130 },
-                18,
-                metrics.scale_factor,
-                title_color,
-            );
-            defer counter.deinit(self.text_system.allocator);
-            for (counter.glyphs) |g| try dl.pushGlyph(.{ .bounds = g.bounds, .uv = g.uv, .color = g.color });
-        }
-
-        // Scissor 演示：故意超宽的进度条，限制在圆角槽内
-        const clip_box = dgpui.math.Rect.init(card_x + 24, card_y + 180, card_w - 48, 28);
-        try dl.pushQuad(.{
-            .bounds = clip_box,
-            .background = dgpui.math.Color.fromHex(0x181926),
-            .border_color = dgpui.math.Color.fromHex(0x363a4f),
-            .border_width = 1.0,
-            .corner_radius = 8.0,
-        });
-        try dl.pushClip(clip_box);
-        try dl.pushQuad(.{
-            .bounds = dgpui.math.Rect.init(clip_box.x, clip_box.y, clip_box.width * 1.4, clip_box.height),
-            .background = dgpui.math.Color.fromHex(if (self.accent_on) 0xa6da95 else 0x8aadf4),
-            .corner_radius = 8.0,
-        });
-        try dl.popClip();
-
-        try dl.pushQuad(.{
-            .bounds = dgpui.math.Rect.init(card_x + card_w - 124, card_y + 224, 100, 34),
-            .background = dgpui.math.Color.fromHex(if (self.accent_on) 0xf5a97f else 0x8aadf4),
-            .corner_radius = 10.0,
-        });
+        // 根高度若被内容撑开，重新用内容高度居中一次（教育向简化：直接 paint）
+        try dgpui.ui.paintTree(root_elem, dl, 0, 0, DemoState.paintText, self);
     }
 
     fn atlasFrame(ctx: *anyopaque) ?dgpui.app.AtlasFrame {
@@ -153,7 +154,7 @@ const DemoState = struct {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
-    const sdl = try dgpui.backend.sdl.SdlBackend.init(gpa, "dgpui — PR 3: Text Shaping & GlyphAtlas", 840, 620);
+    const sdl = try dgpui.backend.sdl.SdlBackend.init(gpa, "dgpui — PR 4: DSL + Flex", 900, 640);
     defer sdl.deinitSelf();
 
     var state = DemoState{};

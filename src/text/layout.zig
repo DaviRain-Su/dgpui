@@ -120,6 +120,112 @@ pub const TextSystem = struct {
             },
         };
     }
+
+    /// 给 Flex `measure` 用：按 max_width（逻辑像素）做简单贪心折行，返回包围盒。
+    pub fn measureText(
+        self: *TextSystem,
+        utf8: []const u8,
+        logical_px: f32,
+        scale: f32,
+        max_width_logical: ?f32,
+    ) !math.Size {
+        const pixel_size: u32 = @intFromFloat(@round(@max(1.0, logical_px * scale)));
+        try self.face.setPixelSize(pixel_size);
+        var run = try self.shaper_state.shape(utf8);
+        defer run.deinit(self.allocator);
+
+        const inv_scale = 1.0 / scale;
+        const line_height = self.face.lineHeightPx() * inv_scale;
+        const max_w_phys: ?f32 = if (max_width_logical) |w| w * scale else null;
+
+        var line_w: f32 = 0;
+        var max_line_w: f32 = 0;
+        var lines: f32 = 1;
+        for (run.glyphs) |g| {
+            if (max_w_phys) |mw| {
+                if (line_w > 0 and line_w + g.x_advance > mw) {
+                    max_line_w = @max(max_line_w, line_w);
+                    line_w = 0;
+                    lines += 1;
+                }
+            }
+            line_w += g.x_advance;
+        }
+        max_line_w = @max(max_line_w, line_w);
+        return .{
+            .width = max_line_w * inv_scale,
+            .height = lines * line_height,
+        };
+    }
+
+    /// 按 max_width 折行后输出 glyph quads（逻辑像素）。
+    pub fn prepareWrapped(
+        self: *TextSystem,
+        utf8: []const u8,
+        origin_logical: math.Point,
+        logical_px: f32,
+        scale: f32,
+        max_width_logical: f32,
+        color: math.Color,
+    ) !PreparedText {
+        const pixel_size: u32 = @intFromFloat(@round(@max(1.0, logical_px * scale)));
+        try self.face.setPixelSize(pixel_size);
+        var run = try self.shaper_state.shape(utf8);
+        defer run.deinit(self.allocator);
+
+        var glyphs = try self.allocator.alloc(PreparedGlyph, run.glyphs.len);
+        errdefer self.allocator.free(glyphs);
+
+        const inv_scale = 1.0 / scale;
+        const ascent = self.face.ascenderPx() * inv_scale;
+        const line_height = self.face.lineHeightPx() * inv_scale;
+        const max_w_phys = max_width_logical * scale;
+
+        var pen_x: f32 = 0;
+        var line_index: f32 = 0;
+        var max_line_w: f32 = 0;
+        var out_i: usize = 0;
+
+        for (run.glyphs) |g| {
+            if (pen_x > 0 and pen_x + g.x_advance > max_w_phys) {
+                max_line_w = @max(max_line_w, pen_x);
+                pen_x = 0;
+                line_index += 1;
+            }
+
+            const uv_px = try self.atlas.getOrRasterize(&self.face, g.glyph_id, pixel_size);
+            const gx_phys = pen_x + g.x_offset + @as(f32, @floatFromInt(uv_px.bearing_x));
+            const gy_phys = -g.y_offset - @as(f32, @floatFromInt(uv_px.bearing_y));
+
+            const bounds = math.Rect{
+                .x = origin_logical.x + gx_phys * inv_scale,
+                .y = origin_logical.y + line_index * line_height + gy_phys * inv_scale + ascent,
+                .width = @as(f32, @floatFromInt(uv_px.width)) * inv_scale,
+                .height = @as(f32, @floatFromInt(uv_px.height)) * inv_scale,
+            };
+            const uv_left = @as(f32, @floatFromInt(uv_px.x)) / @as(f32, @floatFromInt(self.atlas.width));
+            const uv_top = @as(f32, @floatFromInt(uv_px.y)) / @as(f32, @floatFromInt(self.atlas.height));
+            const uv_right = @as(f32, @floatFromInt(uv_px.x + uv_px.width)) / @as(f32, @floatFromInt(self.atlas.width));
+            const uv_bottom = @as(f32, @floatFromInt(uv_px.y + uv_px.height)) / @as(f32, @floatFromInt(self.atlas.height));
+
+            glyphs[out_i] = .{
+                .bounds = bounds,
+                .uv = math.Rect.init(uv_left, uv_top, uv_right - uv_left, uv_bottom - uv_top),
+                .color = color,
+            };
+            out_i += 1;
+            pen_x += g.x_advance;
+        }
+        max_line_w = @max(max_line_w, pen_x);
+
+        return .{
+            .glyphs = glyphs[0..out_i],
+            .size = .{
+                .width = max_line_w * inv_scale,
+                .height = (line_index + 1.0) * line_height,
+            },
+        };
+    }
 };
 
 test "TextSystem shapes Latin and CJK and fills glyph atlas" {
