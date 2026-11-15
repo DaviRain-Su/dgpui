@@ -7,6 +7,7 @@ pub const text = element.text;
 pub const textStyled = element.textStyled;
 pub const layoutTree = element.layoutTree;
 pub const paintTree = element.paintTree;
+pub const paintTreeHit = element.paintTreeHit;
 
 test {
     _ = @import("element.zig");

@@ -7,6 +7,7 @@ const std = @import("std");
 const math = @import("../math.zig");
 const flex = @import("../layout/flex.zig");
 const scene = @import("../scene.zig");
+const hitbox = @import("../hitbox.zig");
 
 pub const TextContent = struct {
     bytes: []const u8,
@@ -28,6 +29,10 @@ pub const Element = struct {
     shadow_offset: math.Point = .{},
     text: ?TextContent = null,
     children: std.ArrayList(*Element) = .empty,
+    /// 点击回调（只应捕获 EntityId / 持久状态，禁止捕获 FrameArena 指针）
+    on_click: ?hitbox.HitHandler = null,
+    on_click_ctx: ?*anyopaque = null,
+    hit_tag: u64 = 0,
     /// 布局结果（相对父内容区）
     layout_node: flex.Node = .{},
 
@@ -123,6 +128,17 @@ pub const ElementBuilder = struct {
         self.elem.shadow_color = color;
         self.elem.shadow_blur = blur;
         self.elem.shadow_offset = offset;
+        return self;
+    }
+
+    pub fn onClick(self: ElementBuilder, handler: hitbox.HitHandler, ctx: ?*anyopaque) ElementBuilder {
+        self.elem.on_click = handler;
+        self.elem.on_click_ctx = ctx;
+        return self;
+    }
+
+    pub fn hitTag(self: ElementBuilder, tag: u64) ElementBuilder {
+        self.elem.hit_tag = tag;
         return self;
     }
 
@@ -251,9 +267,38 @@ pub fn paintTree(
     paint_text: ?PaintTextFn,
     paint_text_ctx: ?*anyopaque,
 ) !void {
+    try paintTreeHit(elem, dl, abs_x, abs_y, paint_text, paint_text_ctx, null, null, null);
+}
+
+pub fn paintTreeHit(
+    elem: *const Element,
+    dl: *scene.DisplayList,
+    abs_x: f32,
+    abs_y: f32,
+    paint_text: ?PaintTextFn,
+    paint_text_ctx: ?*anyopaque,
+    hits: ?*hitbox.HitList,
+    parent_hit: ?u32,
+    clip: ?math.Rect,
+) !void {
     const x = abs_x + elem.layout_node.x;
     const y = abs_y + elem.layout_node.y;
     const bounds = math.Rect.init(x, y, elem.layout_node.width, elem.layout_node.height);
+
+    var my_hit: ?u32 = parent_hit;
+    if (hits) |hl| {
+        // 只要有点击回调，或需要作为冒泡父节点，就登记 hitbox
+        if (elem.on_click != null or elem.children.items.len > 0 or elem.hit_tag != 0) {
+            my_hit = try hl.push(.{
+                .bounds = bounds,
+                .clip = clip,
+                .handler = elem.on_click,
+                .ctx = elem.on_click_ctx,
+                .parent = parent_hit,
+                .tag = elem.hit_tag,
+            });
+        }
+    }
 
     if (elem.kind == .box) {
         if (elem.background.a > 0 or elem.border_width > 0 or elem.shadow_color.a > 0) {
@@ -287,7 +332,7 @@ pub fn paintTree(
     }
 
     for (elem.children.items) |child| {
-        try paintTree(child, dl, x, y, paint_text, paint_text_ctx);
+        try paintTreeHit(child, dl, x, y, paint_text, paint_text_ctx, hits, my_hit, clip);
     }
 }
 

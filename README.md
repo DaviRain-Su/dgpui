@@ -39,7 +39,7 @@
 
 ## 这个项目为什么要这么拆分？
 
-很多 GUI 教程上来就堆几十个文件。为了方便**边做边学、按 PR 逐个复习**，路线图拆成 **6 个 PR**。PR 1–4 已实现，PR 5–6 还在路上：
+很多 GUI 教程上来就堆几十个文件。为了方便**边做边学、按 PR 逐个复习**，路线图拆成 **6 个 PR**。PR 1–5 已实现，PR 6 还在路上：
 
 | PR | 分支名 | 解决什么问题（大白话） | 对应的核心技术 / 面试高频点 |
 | :--- | :--- | :--- | :--- |
@@ -62,6 +62,7 @@
 | `damage_rect` / `DamageRegion` | **已计算并接到后端**。桌面端 Swapchain 仍整屏 `LOADOP_CLEAR`；Scissor 执行 clip 栈 | `src/scene.zig` / `src/backend/sdl.zig` |
 | `FrameArena`、`DisplayList`、SDF Quad、HarfBuzz、FreeType、`GlyphAtlas` | **已实现（PR 2–3）** | `src/arena.zig` `src/scene.zig` `src/text/` `src/shader/` |
 | 链式 DSL + 手写 Flex | **已实现（PR 4）** | `src/ui/` `src/layout/` |
+| EntityStore + Hitbox | **已实现（PR 5）** | `src/entity.zig` `src/hitbox.zig` |
 | `Entity`、Hitbox、滚动、焦点 | **计划中** | 见 `docs/architecture.md` |
 
 ## 技术栈

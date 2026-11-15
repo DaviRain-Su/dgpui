@@ -10,6 +10,7 @@ const std = @import("std");
 const math = @import("math.zig");
 const arena = @import("arena.zig");
 const scene = @import("scene.zig");
+const hitbox = @import("hitbox.zig");
 const platform = @import("backend/platform.zig");
 const renderer = @import("backend/renderer.zig");
 const HeadlessBackend = @import("backend/headless.zig").HeadlessBackend;
@@ -29,6 +30,7 @@ pub const AppCallbacks = struct {
         dl: *scene.DisplayList,
         frame_alloc: std.mem.Allocator,
         metrics: platform.WindowMetrics,
+        hits: *hitbox.HitList,
     ) anyerror!void = null,
     /// 可选：本帧字形图集快照（由 onRender 侧的 TextSystem 提供）
     atlasFrame: ?*const fn (ctx: *anyopaque) ?AtlasFrame = null,
@@ -42,6 +44,7 @@ pub const AppLoop = struct {
     frame_arena: arena.FrameArena,
     display_list: scene.DisplayList,
     prev_display_list: ?scene.DisplayList = null,
+    hit_list: hitbox.HitList,
     clear_color: math.Color = math.Color.fromHex(0x1e1e2e),
     needs_redraw: bool = true,
     running: bool = true,
@@ -58,12 +61,14 @@ pub const AppLoop = struct {
             .renderer_backend = renderer_backend,
             .frame_arena = arena.FrameArena.init(allocator),
             .display_list = scene.DisplayList.init(allocator),
+            .hit_list = hitbox.HitList.init(allocator),
         };
     }
 
     pub fn deinit(self: *AppLoop) void {
         if (self.prev_display_list) |*prev| prev.deinit();
         self.display_list.deinit();
+        self.hit_list.deinit();
         self.frame_arena.deinit();
     }
 
@@ -120,8 +125,16 @@ pub const AppLoop = struct {
             .redraw_requested => {
                 self.needs_redraw = true;
             },
-            // 输入事件留给回调。text_editing 只是翻译进了平台事件，循环本身还不画 IME。
-            .mouse_move, .mouse_down, .mouse_up, .scroll, .key_down, .text_input, .text_editing => {},
+            .mouse_down => |md| {
+                // 左键：用上一帧 paint 登记的 Hitbox 做倒序命中 + 冒泡。
+                if (md.button == .left) {
+                    if (self.hit_list.dispatchClick(md.pos)) {
+                        self.requestRedraw();
+                    }
+                }
+            },
+            // 其余输入事件留给回调。text_editing 只是翻译进了平台事件，循环本身还不画 IME。
+            .mouse_move, .mouse_up, .scroll, .key_down, .text_input, .text_editing => {},
         }
 
         if (self.callbacks) |cb| {
@@ -137,11 +150,12 @@ pub const AppLoop = struct {
 
         const m = self.platform_backend.metrics();
         self.display_list.clearRetainingCapacity();
+        self.hit_list.clearRetainingCapacity();
 
         var has_scene = false;
         if (self.callbacks) |cb| {
             if (cb.onRender) |render_fn| {
-                try render_fn(cb.ctx, &self.display_list, self.frame_arena.allocator(), m);
+                try render_fn(cb.ctx, &self.display_list, self.frame_arena.allocator(), m, &self.hit_list);
                 has_scene = true;
             }
         }
@@ -281,6 +295,7 @@ test "AppLoop resets FrameArena each frame and computes DamageRegion between fra
             dl: *scene.DisplayList,
             frame_alloc: std.mem.Allocator,
             _: platform.WindowMetrics,
+            _: *hitbox.HitList,
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             // 从 FrameArena 分配一笔临时字符串，验证帧末会释放容量复用且不泄漏
