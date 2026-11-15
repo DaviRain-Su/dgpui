@@ -1,14 +1,25 @@
 const std = @import("std");
 const dgpui = @import("dgpui");
 
-const DemoState = struct {
+const Counter = struct {
     clicks: usize = 0,
     accent_on: bool = false,
+};
+
+const DemoState = struct {
+    entities: dgpui.entity.EntityStore = undefined,
+    counter: Counter = .{},
+    counter_id: dgpui.entity.EntityId = .{ .index = 0, .generation = 0 },
+    view_key: u64 = 1,
     text_system: dgpui.text.TextSystem = undefined,
     text_ready: bool = false,
     scale: f32 = 1,
 
-    fn setupText(self: *DemoState, gpa: std.mem.Allocator) !void {
+    fn setup(self: *DemoState, gpa: std.mem.Allocator) !void {
+        self.entities = dgpui.entity.EntityStore.init(gpa);
+        self.counter_id = try self.entities.insert(&self.counter);
+        try self.entities.observe(self.counter_id, self.view_key);
+
         const path = dgpui.text.font.defaultFontPath() orelse {
             std.log.err("no system font found for demo text", .{});
             return error.FontNotFound;
@@ -17,24 +28,40 @@ const DemoState = struct {
         self.text_ready = true;
     }
 
-    fn deinitText(self: *DemoState) void {
+    fn deinit(self: *DemoState) void {
         if (self.text_ready) self.text_system.deinit();
         self.text_ready = false;
+        self.entities.deinit();
+    }
+
+    fn onBump(ctx: ?*anyopaque, _: dgpui.math.Point) bool {
+        const self: *DemoState = @ptrCast(@alignCast(ctx.?));
+        // 回调只持有持久 DemoState / EntityId，绝不捕获本帧 Element*
+        if (self.entities.get(self.counter_id)) |ptr| {
+            const c: *Counter = @ptrCast(@alignCast(ptr));
+            c.clicks += 1;
+            c.accent_on = !c.accent_on;
+            self.entities.notify(self.counter_id) catch {};
+            std.log.info("counter clicked -> {d}", .{c.clicks});
+            return true;
+        }
+        return false;
     }
 
     fn onEvent(ctx: *anyopaque, ev: dgpui.backend.platform.Event, loop: *dgpui.app.AppLoop) void {
         const self: *DemoState = @ptrCast(@alignCast(ctx));
         switch (ev) {
-            .mouse_down => |md| {
-                self.clicks += 1;
-                self.accent_on = !self.accent_on;
-                loop.requestRedraw();
-                std.log.info("mouse_down at ({d:.1}, {d:.1}), clicks={d}", .{ md.pos.x, md.pos.y, self.clicks });
-            },
             .key_down => |kd| {
                 if (kd.key == .escape) loop.quit();
             },
-            else => {},
+            else => {
+                // mouse_down 由 AppLoop 通过 Hitbox 倒序命中处理；
+                // Entity notify 的脏标记在此合并成一次 requestRedraw。
+                if (self.entities.anyDirty()) {
+                    self.entities.clearDirty();
+                    loop.requestRedraw();
+                }
+            },
         }
     }
 
@@ -86,23 +113,37 @@ const DemoState = struct {
         dl: *dgpui.scene.DisplayList,
         frame_alloc: std.mem.Allocator,
         metrics: dgpui.backend.platform.WindowMetrics,
+        hits: *dgpui.hitbox.HitList,
     ) !void {
         const self: *DemoState = @ptrCast(@alignCast(ctx));
         self.scale = metrics.scale_factor;
 
-        const accent = dgpui.math.Color.fromHex(if (self.accent_on) 0xa6da95 else 0x8aadf4);
+        const counter = if (self.entities.get(self.counter_id)) |ptr|
+            @as(*Counter, @ptrCast(@alignCast(ptr))).*
+        else
+            self.counter;
+
+        const accent = dgpui.math.Color.fromHex(if (counter.accent_on) 0xa6da95 else 0x8aadf4);
         const title_color = dgpui.math.Color.fromHex(0xcad3f5);
         const body_color = dgpui.math.Color.fromHex(0xa5adce);
 
         var counter_buf: [64]u8 = undefined;
-        const counter_text = try std.fmt.bufPrint(&counter_buf, "clicks = {d}", .{self.clicks});
+        const counter_text = try std.fmt.bufPrint(&counter_buf, "clicks = {d}", .{counter.clicks});
         const card_w: f32 = @min(480.0, @max(280.0, metrics.logical_width - 64.0));
 
-        // GPUI 风格链式 DSL：布局由 Flex 引擎算，不再手写绝对 x/y。
-        var tags = (try dgpui.ui.div(frame_alloc)).flexRow().gap(10);
-        tags = try tags.child((try dgpui.ui.div(frame_alloc)).bg(dgpui.math.Color.fromHex(0x363a4f)).rounded(17).w(88).h(34));
-        tags = try tags.child((try dgpui.ui.div(frame_alloc)).bg(dgpui.math.Color.fromHex(0x363a4f)).rounded(17).w(72).h(34));
-        tags = try tags.child((try dgpui.ui.div(frame_alloc)).bg(accent).rounded(10).grow(1).h(34));
+        // 可点击按钮：Hitbox 在 paintTreeHit 时登记；回调只持有 self。
+        var button = (try dgpui.ui.div(frame_alloc))
+            .flexRow()
+            .items(.center)
+            .justify(.center)
+            .gap(8)
+            .px(16)
+            .py(10)
+            .bg(accent)
+            .rounded(10)
+            .onClick(DemoState.onBump, self)
+            .hitTag(1);
+        button = try button.child(try dgpui.ui.textStyled(frame_alloc, "Bump Counter", 16, dgpui.math.Color.fromHex(0x1e1e2e)));
 
         var card = (try dgpui.ui.div(frame_alloc))
             .flexCol()
@@ -110,14 +151,14 @@ const DemoState = struct {
             .p(24)
             .w(card_w)
             .bg(dgpui.math.Color.fromHex(0x24273a))
-            .border(dgpui.math.Color.fromHex(if (self.accent_on) 0x8aadf4 else 0x494d64), 1.5)
+            .border(dgpui.math.Color.fromHex(if (counter.accent_on) 0x8aadf4 else 0x494d64), 1.5)
             .rounded(16)
             .shadow(dgpui.math.Color.fromHexRgba(0x00000090), 20, .{ .x = 0, .y = 8 });
-        card = try card.child(try dgpui.ui.textStyled(frame_alloc, "dgpui · DSL + Flex", 22, title_color));
-        card = try card.child(try dgpui.ui.textStyled(frame_alloc, "HarfBuzz measure_text drives wrapping height", 14, body_color));
-        card = try card.child(try dgpui.ui.textStyled(frame_alloc, "Hello 世界 · 窗口变窄时这段字会自动折行并撑高卡片", 16, accent));
+        card = try card.child(try dgpui.ui.textStyled(frame_alloc, "dgpui · Entity + Hitbox", 22, title_color));
+        card = try card.child(try dgpui.ui.textStyled(frame_alloc, "observe/notify + reverse hit-test + bubble", 14, body_color));
+        card = try card.child(try dgpui.ui.textStyled(frame_alloc, "点击按钮：EntityStore 改状态并 notify；不要把 FrameArena 指针塞进回调", 15, accent));
         card = try card.child(try dgpui.ui.textStyled(frame_alloc, counter_text, 18, title_color));
-        card = try card.child(tags);
+        card = try card.child(button);
 
         var root = (try dgpui.ui.div(frame_alloc))
             .flexCol()
@@ -129,9 +170,7 @@ const DemoState = struct {
 
         const root_elem = root.finish();
         try dgpui.ui.layoutTree(root_elem, metrics.logicalSize(), frame_alloc, DemoState.measureText, self);
-
-        // 根高度若被内容撑开，重新用内容高度居中一次（教育向简化：直接 paint）
-        try dgpui.ui.paintTree(root_elem, dl, 0, 0, DemoState.paintText, self);
+        try dgpui.ui.paintTreeHit(root_elem, dl, 0, 0, DemoState.paintText, self, hits, null, null);
     }
 
     fn atlasFrame(ctx: *anyopaque) ?dgpui.app.AtlasFrame {
@@ -154,12 +193,12 @@ const DemoState = struct {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
-    const sdl = try dgpui.backend.sdl.SdlBackend.init(gpa, "dgpui — PR 4: DSL + Flex", 900, 640);
+    const sdl = try dgpui.backend.sdl.SdlBackend.init(gpa, "dgpui — PR 5: Entity + Hitbox", 900, 640);
     defer sdl.deinitSelf();
 
     var state = DemoState{};
-    try state.setupText(gpa);
-    defer state.deinitText();
+    try state.setup(gpa);
+    defer state.deinit();
 
     var loop = dgpui.app.AppLoop.init(gpa, sdl.platformBackend(), sdl.rendererBackend());
     defer loop.deinit();
