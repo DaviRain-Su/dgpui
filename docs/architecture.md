@@ -113,7 +113,7 @@
 
 ---
 
-### Step 6：滚动、焦点输入与 `comptime` DSL 对比实验——计划中，还没有代码
+### Step 6：滚动、焦点输入与 `comptime` DSL 对比实验——已落地（见 `docs/pr6-scroll-focus-comptime.md`）
 
 - **解决什么问题**：
   1. 列表内容超出窗口高度怎么办？-> 滚轮事件改变 `Entity` 里的 `scroll_offset`，渲染时包一层 `PushClip(box)` 并整体平移子节点坐标。
