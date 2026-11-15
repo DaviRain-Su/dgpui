@@ -31,6 +31,13 @@ pub const ShapedRun = struct {
     }
 };
 
+/// 只读视图：缓存命中或刚 shape 完的 run 都用它参与布局/摆放，
+/// 调用方**不负责释放**（所有权在缓存或调用方的 ShapedRun 上）。
+pub const ShapedRunView = struct {
+    glyphs: []const ShapedGlyph,
+    width: f32,
+};
+
 pub const TextShaper = struct {
     allocator: std.mem.Allocator,
     face: *font.FontFace,

@@ -36,16 +36,120 @@ pub const PreparedText = struct {
     }
 };
 
+/// HarfBuzz shaping 结果的 LRU 缓存。
+///
+/// 为什么值得缓存：每帧布局会对每个文本节点 `measure` 一次、绘制时再 prepare
+/// 一次，两次都要跑 HarfBuzz。同一个 (文本字节, 物理字号) 的 shape 结果在字体
+/// 不变的前提下永远相同 —— 缓存后稳态一帧 0 次 shaping，只有字形光栅化/贴图。
+///
+/// 教育版实现：线性扫描（先比预计算哈希再比字节）+ LRU clock；默认上限 256 条。
+/// 真实框架用 hash map + 双向链表做 O(1) LRU，并常带字体回退链的整树缓存。
+pub const ShapeCache = struct {
+    const CacheEntry = struct {
+        /// 拥有的文本字节拷贝（key 的一部分）
+        bytes: []u8,
+        pixel_size: u32,
+        /// 预计算 key 哈希：先比整数，命中才比对字节
+        hash: u64,
+        /// HarfBuzz 输出（所有权在缓存）
+        glyphs: []shaper.ShapedGlyph,
+        width: f32,
+        last_used: u64,
+    };
+
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(CacheEntry) = .empty,
+    /// 上限；测试可以调小验证淘汰
+    max_entries: usize = 256,
+    /// LRU 时钟：每次命中/写入自增
+    accesses: u64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator) ShapeCache {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *ShapeCache) void {
+        for (self.entries.items) |e| {
+            self.allocator.free(e.bytes);
+            self.allocator.free(e.glyphs);
+        }
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn hashKey(bytes: []const u8, pixel_size: u32) u64 {
+        var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+        h.update(bytes);
+        h.update(std.mem.asBytes(&pixel_size));
+        return h.final();
+    }
+
+    /// 命中并刷新 LRU。
+    pub fn find(self: *ShapeCache, bytes: []const u8, pixel_size: u32) ?*CacheEntry {
+        const hk = hashKey(bytes, pixel_size);
+        for (self.entries.items) |*e| {
+            if (e.hash == hk and e.pixel_size == pixel_size and std.mem.eql(u8, e.bytes, bytes)) {
+                self.accesses += 1;
+                e.last_used = self.accesses;
+                return e;
+            }
+        }
+        return null;
+    }
+
+    /// 写入并**接管 glyphs 所有权**。满了就驱逐 LRU 最老的一条（原地覆盖）。
+    pub fn put(self: *ShapeCache, bytes: []const u8, pixel_size: u32, glyphs: []shaper.ShapedGlyph, width: f32) !*CacheEntry {
+        const cap = @max(self.max_entries, 1);
+        var slot: ?usize = null;
+        if (self.entries.items.len >= cap) {
+            var oldest: usize = 0;
+            for (self.entries.items, 0..) |e, i| {
+                if (e.last_used < self.entries.items[oldest].last_used) oldest = i;
+            }
+            const victim = &self.entries.items[oldest];
+            self.allocator.free(victim.bytes);
+            self.allocator.free(victim.glyphs);
+            slot = oldest;
+        }
+
+        const owned = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned);
+        self.accesses += 1;
+
+        const entry = CacheEntry{
+            .bytes = owned,
+            .pixel_size = pixel_size,
+            .hash = hashKey(bytes, pixel_size),
+            .glyphs = glyphs,
+            .width = width,
+            .last_used = self.accesses,
+        };
+        if (slot) |i| {
+            self.entries.items[i] = entry;
+            return &self.entries.items[i];
+        }
+        try self.entries.append(self.allocator, entry);
+        return &self.entries.items[self.entries.items.len - 1];
+    }
+};
+
 pub const TextSystem = struct {
     allocator: std.mem.Allocator,
     library: font.FontLibrary,
     face: font.FontFace,
     shaper_state: shaper.TextShaper,
     atlas: atlas.GlyphAtlas,
+    /// HarfBuzz shaping 结果缓存（LRU）。同一个 (文本, 物理字号) 每帧会被
+    /// measure 和 paint 各取一次，缓存后稳态每帧 0 次 shaping。
+    cache: ShapeCache = undefined,
+    /// 实际走到 HarfBuzz 的次数（= 缓存 miss 数）。测试 / 面试演示用。
+    shape_calls: usize = 0,
 
     pub fn init(self: *TextSystem, allocator: std.mem.Allocator, font_path: [*:0]const u8, atlas_w: u32, atlas_h: u32) !void {
         self.* = undefined;
         self.allocator = allocator;
+        self.cache = ShapeCache.init(allocator);
+        self.shape_calls = 0;
         self.library = try font.FontLibrary.init();
         errdefer self.library.deinit();
         self.face = try font.FontFace.open(&self.library, font_path, 0);
@@ -61,7 +165,26 @@ pub const TextSystem = struct {
         self.shaper_state.deinit();
         self.face.deinit();
         self.library.deinit();
+        self.cache.deinit();
         self.* = undefined;
+    }
+
+    /// shape（带缓存）：命中则零成本返回只读视图；未命中才走 HarfBuzz，
+    /// 并把结果（glyphs 所有权）搬进缓存。返回的视图由缓存持有，调用方不释放。
+    pub fn shapeCached(self: *TextSystem, utf8: []const u8, pixel_size: u32) !shaper.ShapedRunView {
+        if (self.cache.find(utf8, pixel_size)) |e| {
+            return .{ .glyphs = e.glyphs, .width = e.width };
+        }
+        self.shape_calls += 1;
+        try self.face.setPixelSize(pixel_size);
+        var run = try self.shaper_state.shape(utf8);
+        const entry = self.cache.put(utf8, pixel_size, run.glyphs, run.width) catch |err| {
+            run.deinit(self.allocator);
+            return err;
+        };
+        // glyphs 所有权已移交缓存；置空防止后续误双重释放
+        run.glyphs = &.{};
+        return .{ .glyphs = entry.glyphs, .width = entry.width };
     }
 
     const PlaceOptions = struct {
@@ -80,7 +203,7 @@ pub const TextSystem = struct {
     /// 绝不让一帧绘制整体失败。
     /// 教育取舍：不做 LRU 淘汰（淘汰会让同帧早前 run 的 UV 失效，很难做对）；
     /// 长期运行同一字号集合下图集会稳定，不会无限增长。
-    fn placeGlyphs(self: *TextSystem, run: shaper.ShapedRun, opts: PlaceOptions) !PreparedText {
+    fn placeGlyphs(self: *TextSystem, run: shaper.ShapedRunView, opts: PlaceOptions) !PreparedText {
         const inv_scale = 1.0 / opts.scale;
         const ascent = self.face.ascenderPx() * inv_scale;
         const line_height = self.face.lineHeightPx() * inv_scale;
@@ -173,12 +296,9 @@ pub const TextSystem = struct {
         color: math.Color,
     ) !PreparedText {
         const pixel_size: u32 = @intFromFloat(@round(@max(1.0, logical_px * scale)));
-        try self.face.setPixelSize(pixel_size);
+        const view = try self.shapeCached(utf8, pixel_size);
 
-        var run = try self.shaper_state.shape(utf8);
-        defer run.deinit(self.allocator);
-
-        return self.placeGlyphs(run, .{
+        return self.placeGlyphs(view, .{
             .origin = origin_logical,
             .pixel_size = pixel_size,
             .scale = scale,
@@ -196,9 +316,7 @@ pub const TextSystem = struct {
         max_width_logical: ?f32,
     ) !math.Size {
         const pixel_size: u32 = @intFromFloat(@round(@max(1.0, logical_px * scale)));
-        try self.face.setPixelSize(pixel_size);
-        var run = try self.shaper_state.shape(utf8);
-        defer run.deinit(self.allocator);
+        const run = try self.shapeCached(utf8, pixel_size);
 
         const inv_scale = 1.0 / scale;
         const line_height = self.face.lineHeightPx() * inv_scale;
@@ -235,11 +353,9 @@ pub const TextSystem = struct {
         color: math.Color,
     ) !PreparedText {
         const pixel_size: u32 = @intFromFloat(@round(@max(1.0, logical_px * scale)));
-        try self.face.setPixelSize(pixel_size);
-        var run = try self.shaper_state.shape(utf8);
-        defer run.deinit(self.allocator);
+        const view = try self.shapeCached(utf8, pixel_size);
 
-        return self.placeGlyphs(run, .{
+        return self.placeGlyphs(view, .{
             .origin = origin_logical,
             .pixel_size = pixel_size,
             .scale = scale,
@@ -315,4 +431,51 @@ test "TextSystem shapes Latin and CJK and fills glyph atlas" {
         defer m.deinit(gpa);
         try std.testing.expect(m.glyphs.len >= prepared.glyphs.len);
     }
+}
+
+test "shape cache avoids repeated HarfBuzz shaping" {
+    const gpa = std.testing.allocator;
+    const path = font.defaultFontPath() orelse return error.SkipZigTest;
+    var sys: TextSystem = undefined;
+    try sys.init(gpa, path.ptr, 512, 512);
+    defer sys.deinit();
+
+    _ = try sys.measureText("Hello 世界", 16, 1.0, 100);
+    const after_first = sys.shape_calls;
+    try std.testing.expect(after_first > 0);
+
+    // 同 (文本, 字号) 再次 measure：命中缓存，shape_calls 不变
+    _ = try sys.measureText("Hello 世界", 16, 1.0, 100);
+    try std.testing.expectEqual(after_first, sys.shape_calls);
+
+    // paint 路径（prepareLine）命中同一份缓存 —— 这就是“measure+paint 各一次”
+    // 从每帧 2 次 shaping 变成 0 次的机制
+    var prepared = try sys.prepareLine("Hello 世界", .{ .x = 0, .y = 0 }, 16, 1.0, math.Color.white);
+    defer prepared.deinit(gpa);
+    try std.testing.expectEqual(after_first, sys.shape_calls);
+
+    // 不同字号 → 不同缓存 key → 一次新 shape
+    _ = try sys.measureText("Hello 世界", 24, 1.0, 100);
+    try std.testing.expectEqual(after_first + 1, sys.shape_calls);
+}
+
+test "shape cache evicts least recently used entry" {
+    const gpa = std.testing.allocator;
+    const path = font.defaultFontPath() orelse return error.SkipZigTest;
+    var sys: TextSystem = undefined;
+    try sys.init(gpa, path.ptr, 512, 512);
+    defer sys.deinit();
+    sys.cache.max_entries = 2;
+
+    _ = try sys.measureText("AAAA", 16, 1.0, null);
+    _ = try sys.measureText("BBBB", 16, 1.0, null);
+    _ = try sys.measureText("CCCC", 16, 1.0, null); // 满 -> 驱逐最久未用的 A
+    try std.testing.expectEqual(@as(usize, 3), sys.shape_calls);
+
+    _ = try sys.measureText("AAAA", 16, 1.0, null); // A 已被驱逐 -> 再 shape，驱逐 B
+    try std.testing.expectEqual(@as(usize, 4), sys.shape_calls);
+
+    _ = try sys.measureText("CCCC", 16, 1.0, null); // C 仍在 -> 命中
+    try std.testing.expectEqual(@as(usize, 4), sys.shape_calls);
+    try std.testing.expectEqual(@as(usize, 2), sys.cache.entries.items.len);
 }

@@ -27,6 +27,7 @@
 ## 三个「讲出细节」的加分点
 - **Flex 踩坑**（来自 Codex review）：显式宽度优先测量；shrink 后按最终宽度重测高度；column grow 高度不被重测冲掉；shrink 触零冻结后按**原始尺寸**权重重分。
 - **headless smoke**：`src/demo.zig` 用 Headless 后端跑完整闭环——画一帧取输入框 hitbox 中心→点击聚焦→输入"买牛奶"→Enter 提交→滚轮 120px→断言 9 条 + offset=120 + 焦点保持。证明窗口逻辑可在 CI 无窗口复现。
+- **性能预算**：图集满→就地扩容保 UV；shaped-run LRU 缓存 → 稳态每帧 0 次 HarfBuzz / 0 次光栅化（`sys.shape_calls` 可断言）。
 - **DRM/KMS**：换后端只动两个 VTable，上层 DSL/布局/Entity 零改动。
 
 ## 诚实边界（被问就认）
