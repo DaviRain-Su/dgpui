@@ -196,17 +196,26 @@ fn layoutChildren(node: *Node) void {
 
     const pad = node.style.padding;
     const inner_w = @max(0, node.width - pad.horizontal());
-    const inner_h = @max(0, node.height - pad.vertical());
     const dir = node.style.direction;
 
-    // 1) 先测量每个孩子（宽度约束 = 父内容宽；孩子显式宽在 measureNode 内优先）
+    // 1) 初始测量
     for (node.children) |child| {
-        const sz = measureNode(child, .{ .definite = inner_w }, .{ .definite = inner_h });
+        const sz = measureNode(child, .{ .definite = inner_w }, .max_content);
         child.width = child.style.width.resolve() orelse sz.width;
         child.height = child.style.height.resolve() orelse sz.height;
     }
 
-    // 2) grow / shrink 主轴
+    // 2) column 的交叉轴（宽度）先 stretch 定宽，再按最终宽度重测折行高度
+    if (dir == .column and node.style.align_items == .stretch) {
+        for (node.children) |child| {
+            if (child.style.width == .auto) child.width = inner_w;
+        }
+    }
+    for (node.children) |child| {
+        remeasureHeightForWidth(child, child.width);
+    }
+
+    // 3) 主轴 grow / shrink（此步之后：row 会改宽度，column 会改高度）
     var total_main: f32 = 0;
     var total_grow: f32 = 0;
     var total_shrink_weighted: f32 = 0;
@@ -218,7 +227,47 @@ fn layoutChildren(node: *Node) void {
     }
     if (n > 1) total_main += node.style.gap * @as(f32, @floatFromInt(n - 1));
 
+    // 父 height=auto 时，主轴可用尺寸先按内容；fixed 则用 inner
+    var inner_h = @max(0, node.height - pad.vertical());
+    if (node.style.height == .auto) {
+        var content_main: f32 = 0;
+        for (node.children, 0..) |child, i| {
+            content_main += if (dir == .row) child.height else child.height;
+            if (dir == .column) {
+                // column 主轴是 height
+            }
+            _ = i;
+        }
+        // 重新按方向汇总
+        content_main = 0;
+        for (node.children, 0..) |child, i| {
+            content_main += if (dir == .row) child.width else child.height;
+            if (i + 1 < n) content_main += node.style.gap;
+        }
+        if (dir == .column) {
+            node.height = content_main + pad.vertical();
+            inner_h = content_main;
+        } else {
+            var max_h: f32 = 0;
+            for (node.children) |child| max_h = @max(max_h, child.height);
+            node.height = max_h + pad.vertical();
+            inner_h = max_h;
+        }
+    }
+
     const available_main = if (dir == .row) inner_w else inner_h;
+    // 若上面 auto 分支重算了 total，需要同步 total_main
+    total_main = 0;
+    total_grow = 0;
+    total_shrink_weighted = 0;
+    for (node.children) |child| {
+        const main = if (dir == .row) child.width else child.height;
+        total_main += main;
+        total_grow += @max(0, child.style.flex_grow);
+        total_shrink_weighted += @max(0, child.style.flex_shrink) * main;
+    }
+    if (n > 1) total_main += node.style.gap * @as(f32, @floatFromInt(n - 1));
+
     const free = available_main - total_main;
     if (free > 0.5 and total_grow > 0) {
         for (node.children) |child| {
@@ -239,48 +288,30 @@ fn layoutChildren(node: *Node) void {
         }
     }
 
-    // 2b) 主轴宽度变化后，对 auto-height 孩子按最终宽度重测折行高度
+    // 4) 仅 row 会在 grow/shrink 后改变宽度 -> 需要再测折行高度
     if (dir == .row) {
         for (node.children) |child| {
             remeasureHeightForWidth(child, child.width);
         }
-        // 若父自身高度也是 auto，按孩子新高度抬高内容（教育版：仅在父 height=auto 时）
         if (node.style.height == .auto) {
             var max_h: f32 = 0;
             for (node.children) |child| max_h = @max(max_h, child.height);
             node.height = max_h + pad.vertical();
-        }
-    } else {
-        // column：宽度被 stretch/显式设定后，也可能影响文字折行
-        for (node.children) |child| {
-            if (child.style.width == .auto and node.style.align_items == .stretch) {
-                child.width = inner_w;
-            }
-            remeasureHeightForWidth(child, child.width);
-        }
-        if (node.style.height == .auto) {
-            var total_h: f32 = 0;
-            for (node.children, 0..) |child, i| {
-                total_h += child.height;
-                if (i + 1 < n) total_h += node.style.gap;
-            }
-            node.height = total_h + pad.vertical();
+            inner_h = max_h;
+        } else {
+            inner_h = @max(0, node.height - pad.vertical());
         }
     }
 
-    // stretch 交叉轴（在重测高度之后）
+    // 5) row 交叉轴 stretch（不要在 column 上用重测覆盖主轴高度）
     const final_inner_h = @max(0, node.height - pad.vertical());
-    if (node.style.align_items == .stretch) {
+    if (dir == .row and node.style.align_items == .stretch) {
         for (node.children) |child| {
-            if (dir == .row) {
-                if (child.style.height == .auto) child.height = final_inner_h;
-            } else {
-                if (child.style.width == .auto) child.width = inner_w;
-            }
+            if (child.style.height == .auto) child.height = final_inner_h;
         }
     }
 
-    // 3) 定位
+    // 6) 定位
     var used_main: f32 = 0;
     for (node.children) |child| used_main += if (dir == .row) child.width else child.height;
     if (n > 1) used_main += node.style.gap * @as(f32, @floatFromInt(n - 1));
@@ -463,4 +494,20 @@ test "row shrink remeasures wrapped text height" {
     try std.testing.expectApproxEqAbs(@as(f32, 150), b.width, 0.01);
     try std.testing.expectEqual(@as(f32, 32), a.height);
     try std.testing.expectEqual(@as(f32, 32), b.height);
+}
+
+test "column flex_grow height is preserved after measure" {
+    const MeasureCtx = struct {
+        fn measure(_: ?*anyopaque, _: AvailableSpace) math.Size {
+            return .{ .width = 50, .height = 20 };
+        }
+    };
+    var child = Node{ .measure = MeasureCtx.measure, .style = .{ .flex_grow = 1 } };
+    const kids = [_]*Node{&child};
+    var root = Node{
+        .style = .{ .direction = .column, .width = .{ .px = 100 }, .height = .{ .px = 100 } },
+        .children = &kids,
+    };
+    layout(&root, .{ .width = 100, .height = 100 });
+    try std.testing.expectApproxEqAbs(@as(f32, 100), child.height, 0.01);
 }

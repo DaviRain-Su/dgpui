@@ -270,12 +270,15 @@ pub fn paintTree(
         }
     } else if (elem.kind == .text) {
         if (elem.text) |t| {
+            const pad = elem.style.padding;
+            const content_origin = math.Point{ .x = x + pad.left, .y = y + pad.top };
+            const content_w = @max(0, bounds.width - pad.horizontal());
             if (paint_text) |f| {
-                try f(paint_text_ctx, dl, t, .{ .x = x, .y = y }, bounds.width);
+                try f(paint_text_ctx, dl, t, content_origin, content_w);
             } else {
-                // Headless / 无文字系统时：用一条占位矩形表示文字行盒
+                // Headless / 无文字系统时：用一条占位矩形表示文字内容盒
                 try dl.pushQuad(.{
-                    .bounds = bounds,
+                    .bounds = math.Rect.init(content_origin.x, content_origin.y, content_w, @max(0, bounds.height - pad.vertical())),
                     .background = t.color,
                     .corner_radius = 2,
                 });
