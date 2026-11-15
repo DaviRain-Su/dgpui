@@ -14,6 +14,13 @@ const platform = @import("backend/platform.zig");
 const renderer = @import("backend/renderer.zig");
 const HeadlessBackend = @import("backend/headless.zig").HeadlessBackend;
 
+pub const AtlasFrame = struct {
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    dirty: bool,
+};
+
 pub const AppCallbacks = struct {
     ctx: *anyopaque,
     onEvent: ?*const fn (ctx: *anyopaque, ev: platform.Event, loop: *AppLoop) void = null,
@@ -23,6 +30,9 @@ pub const AppCallbacks = struct {
         frame_alloc: std.mem.Allocator,
         metrics: platform.WindowMetrics,
     ) anyerror!void = null,
+    /// 可选：本帧字形图集快照（由 onRender 侧的 TextSystem 提供）
+    atlasFrame: ?*const fn (ctx: *anyopaque) ?AtlasFrame = null,
+    atlasClearDirty: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 pub const AppLoop = struct {
@@ -141,13 +151,42 @@ pub const AppLoop = struct {
         else
             null;
 
+        var atlas_pixels: ?[]const u8 = null;
+        var atlas_w: u32 = 0;
+        var atlas_h: u32 = 0;
+        var atlas_dirty = false;
+        if (self.callbacks) |cb| {
+            if (cb.atlasFrame) |f| {
+                if (f(cb.ctx)) |af| {
+                    atlas_pixels = af.pixels;
+                    atlas_w = af.width;
+                    atlas_h = af.height;
+                    atlas_dirty = af.dirty;
+                }
+            }
+        }
+
+        var atlas_uploaded = false;
         try self.renderer_backend.renderFrame(.{
             .logical_size = m.logicalSize(),
             .scale_factor = m.scale_factor,
             .clear_color = self.clear_color,
             .display_list = if (has_scene) &self.display_list else null,
             .damage_rect = damage,
+            .atlas_pixels = atlas_pixels,
+            .atlas_width = atlas_w,
+            .atlas_height = atlas_h,
+            .atlas_dirty = atlas_dirty,
+            .atlas_uploaded = &atlas_uploaded,
         });
+
+        // 只有渲染后端确认本帧真的上传了图集，才清 CPU dirty。
+        // 否则（例如 swapchain acquire 失败）下一帧还要带着 dirty 重试。
+        if (atlas_dirty and atlas_uploaded) {
+            if (self.callbacks) |cb| {
+                if (cb.atlasClearDirty) |f| f(cb.ctx);
+            }
+        }
 
         if (has_scene) {
             if (self.prev_display_list) |*prev| {

@@ -4,7 +4,7 @@
 //! 1. **与 GPU 解耦**：布局和 UI 树完全不知道 Metal/Vulkan/SDL 的存在；
 //!    同一份 DisplayList 既能喂给 Metal，也能喂给软件光栅化器或 Headless 测试。
 //! 2. **方便合批与裁剪**：在这里按绘制顺序（Painter's Order）把嵌套 `push_clip / pop_clip`
-//!    折叠成具体的裁剪矩形，把连续同裁剪区的 Quad 打包成同一批 GPU 实例数据。
+//!    折叠成具体的裁剪矩形，把连续同裁剪区的同类图元打包成同一批 GPU 实例数据。
 //! 3. **方便算脏区**：对比上一帧与当前帧的 DisplayList，可以精确得出哪块矩形发生了变化（DamageRegion）。
 
 const std = @import("std");
@@ -40,9 +40,25 @@ pub const Quad = struct {
     }
 };
 
+/// 贴字形小图用的矩形（逻辑像素 bounds + 图集归一化 UV）
+pub const GlyphQuad = struct {
+    bounds: math.Rect,
+    uv: math.Rect,
+    color: math.Color = math.Color.white,
+
+    pub fn paintBounds(self: GlyphQuad) math.Rect {
+        return self.bounds;
+    }
+
+    pub fn eql(a: GlyphQuad, b: GlyphQuad) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
 /// 与平台/GPU 无关的绘制指令
 pub const DrawCommand = union(enum) {
     quad: Quad,
+    glyph: GlyphQuad,
     /// 将新的裁剪矩形压入栈（会自动与当前栈顶裁剪区求交集）
     push_clip: math.Rect,
     /// 弹出当前裁剪矩形
@@ -81,19 +97,51 @@ comptime {
     if (@sizeOf(QuadInstance) != 96) @compileError("QuadInstance must be exactly 96 bytes for MSL alignment");
 }
 
-/// 同一裁剪区下连续可合批的 Quad 切片（保证严格按 Painter's Order 绘制，遮挡关系不错乱）
-pub const QuadBatch = struct {
+/// 传给字形着色器的实例布局（48 字节 = 3× float4）
+pub const GlyphInstance = extern struct {
+    bounds: [4]f32,
+    uv: [4]f32,
+    color: [4]f32,
+
+    pub fn fromGlyph(g: GlyphQuad) GlyphInstance {
+        return .{
+            .bounds = .{ g.bounds.x, g.bounds.y, g.bounds.width, g.bounds.height },
+            .uv = .{ g.uv.x, g.uv.y, g.uv.width, g.uv.height },
+            .color = .{ g.color.r, g.color.g, g.color.b, g.color.a },
+        };
+    }
+};
+
+comptime {
+    if (@sizeOf(GlyphInstance) != 48) @compileError("GlyphInstance must be exactly 48 bytes for MSL alignment");
+}
+
+pub const BatchKind = enum { quad, glyph };
+
+/// 同一裁剪区下连续可合批的同类图元切片（保证严格按 Painter's Order 绘制）
+pub const DrawBatch = struct {
+    kind: BatchKind,
     clip_rect: ?math.Rect,
     instance_start: u32,
     instance_count: u32,
 };
 
+/// 兼容旧名字
+pub const QuadBatch = DrawBatch;
+
 pub const BuiltBatches = struct {
-    instances: []QuadInstance,
-    batches: []QuadBatch,
+    quad_instances: []QuadInstance,
+    glyph_instances: []GlyphInstance,
+    batches: []DrawBatch,
+
+    /// 兼容旧字段名
+    pub fn instances(self: BuiltBatches) []QuadInstance {
+        return self.quad_instances;
+    }
 
     pub fn deinit(self: *BuiltBatches, allocator: std.mem.Allocator) void {
-        allocator.free(self.instances);
+        allocator.free(self.quad_instances);
+        allocator.free(self.glyph_instances);
         allocator.free(self.batches);
     }
 };
@@ -118,6 +166,10 @@ pub const DisplayList = struct {
         try self.commands.append(self.allocator, .{ .quad = q });
     }
 
+    pub fn pushGlyph(self: *DisplayList, g: GlyphQuad) !void {
+        try self.commands.append(self.allocator, .{ .glyph = g });
+    }
+
     pub fn pushClip(self: *DisplayList, rect: math.Rect) !void {
         try self.commands.append(self.allocator, .{ .push_clip = rect });
     }
@@ -135,12 +187,14 @@ pub const DisplayList = struct {
     }
 
     /// 按 Painter's Order 解析裁剪栈并合批：
-    /// - 相邻、相同裁剪区的 Quad 合并成同一个 `QuadBatch`（1 次 draw call）
-    /// - 遇到裁剪变化（或插入其他图元）时切分批次，确保前后遮挡关系 100% 正确
+    /// - 相邻、相同裁剪区、相同 kind 的图元合并成同一个 `DrawBatch`
+    /// - Quad 与 Glyph 不能合批（管线/纹理不同），遇到 kind 切换必须切批
     pub fn buildBatches(self: *const DisplayList, allocator: std.mem.Allocator) !BuiltBatches {
-        var instances: std.ArrayList(QuadInstance) = .empty;
-        errdefer instances.deinit(allocator);
-        var batches: std.ArrayList(QuadBatch) = .empty;
+        var quad_instances: std.ArrayList(QuadInstance) = .empty;
+        errdefer quad_instances.deinit(allocator);
+        var glyph_instances: std.ArrayList(GlyphInstance) = .empty;
+        errdefer glyph_instances.deinit(allocator);
+        var batches: std.ArrayList(DrawBatch) = .empty;
         errdefer batches.deinit(allocator);
         var clip_stack: std.ArrayList(math.Rect) = .empty;
         defer clip_stack.deinit(allocator);
@@ -160,38 +214,59 @@ pub const DisplayList = struct {
                     }
                 },
                 .quad => |q| {
-                    const current_clip: ?math.Rect = if (clip_stack.items.len > 0)
-                        clip_stack.items[clip_stack.items.len - 1]
-                    else
-                        null;
-
-                    // 完全被空裁剪区裁掉的图元直接跳过
+                    const current_clip = currentClip(clip_stack.items);
                     if (current_clip) |c| {
                         if (c.isEmpty()) continue;
                     }
-
-                    const inst_idx: u32 = @intCast(instances.items.len);
-                    try instances.append(allocator, QuadInstance.fromQuad(q));
-
-                    if (batches.items.len > 0 and optRectEql(batches.items[batches.items.len - 1].clip_rect, current_clip)) {
-                        batches.items[batches.items.len - 1].instance_count += 1;
-                    } else {
-                        try batches.append(allocator, .{
-                            .clip_rect = current_clip,
-                            .instance_start = inst_idx,
-                            .instance_count = 1,
-                        });
+                    const inst_idx: u32 = @intCast(quad_instances.items.len);
+                    try quad_instances.append(allocator, QuadInstance.fromQuad(q));
+                    try appendOrGrowBatch(&batches, allocator, .quad, current_clip, inst_idx);
+                },
+                .glyph => |g| {
+                    const current_clip = currentClip(clip_stack.items);
+                    if (current_clip) |c| {
+                        if (c.isEmpty()) continue;
                     }
+                    const inst_idx: u32 = @intCast(glyph_instances.items.len);
+                    try glyph_instances.append(allocator, GlyphInstance.fromGlyph(g));
+                    try appendOrGrowBatch(&batches, allocator, .glyph, current_clip, inst_idx);
                 },
             }
         }
 
         return .{
-            .instances = try instances.toOwnedSlice(allocator),
+            .quad_instances = try quad_instances.toOwnedSlice(allocator),
+            .glyph_instances = try glyph_instances.toOwnedSlice(allocator),
             .batches = try batches.toOwnedSlice(allocator),
         };
     }
 };
+
+fn currentClip(stack: []const math.Rect) ?math.Rect {
+    return if (stack.len > 0) stack[stack.len - 1] else null;
+}
+
+fn appendOrGrowBatch(
+    batches: *std.ArrayList(DrawBatch),
+    allocator: std.mem.Allocator,
+    kind: BatchKind,
+    clip: ?math.Rect,
+    inst_idx: u32,
+) !void {
+    if (batches.items.len > 0) {
+        const last = &batches.items[batches.items.len - 1];
+        if (last.kind == kind and optRectEql(last.clip_rect, clip)) {
+            last.instance_count += 1;
+            return;
+        }
+    }
+    try batches.append(allocator, .{
+        .kind = kind,
+        .clip_rect = clip,
+        .instance_start = inst_idx,
+        .instance_count = 1,
+    });
+}
 
 fn optRectEql(a: ?math.Rect, b: ?math.Rect) bool {
     if (a == null and b == null) return true;
@@ -219,9 +294,9 @@ pub const DamageRegion = struct {
     /// 对比前后两帧 DisplayList，找出所有增删或属性变化命令的影响包围盒并集。
     /// 若完全一致则返回 null（无需重绘任何区域）。
     ///
-    /// 关键：不能只按命令索引做 `eql`。裁剪栈拓扑变化时，同一个 Quad 命令可能
+    /// 关键：不能只按命令索引做 `eql`。裁剪栈拓扑变化时，同一个绘制命令可能
     /// 仍出现在相同索引，但其有效裁剪区变了，可见像素会变化。因此先把两帧
-    /// 都展平为 `(quad, effective_clip)` 序列，再对比每条绘制的可见包围盒。
+    /// 都展平为 `(bounds, effective_clip)` 序列，再对比每条绘制的可见包围盒。
     pub fn fromDisplayListDiff(
         allocator: std.mem.Allocator,
         prev: *const DisplayList,
@@ -237,25 +312,32 @@ pub const DamageRegion = struct {
         for (0..min_len) |i| {
             const a = prev_items[i];
             const b = next_items[i];
-            if (!Quad.eql(a.quad, b.quad) or !optRectEql(a.clip, b.clip)) {
-                dmg.merge(visibleBounds(a.quad, a.clip));
-                dmg.merge(visibleBounds(b.quad, b.clip));
+            if (!paintedEql(a, b) or !optRectEql(a.clip, b.clip)) {
+                dmg.merge(visiblePaintedBounds(a));
+                dmg.merge(visiblePaintedBounds(b));
             }
         }
         for (min_len..prev_items.len) |i| {
-            dmg.merge(visibleBounds(prev_items[i].quad, prev_items[i].clip));
+            dmg.merge(visiblePaintedBounds(prev_items[i]));
         }
         for (min_len..next_items.len) |i| {
-            dmg.merge(visibleBounds(next_items[i].quad, next_items[i].clip));
+            dmg.merge(visiblePaintedBounds(next_items[i]));
         }
         return dmg;
     }
 };
 
 const PaintedItem = struct {
-    quad: Quad,
+    kind: BatchKind,
+    bounds: math.Rect,
+    /// 用命令本身做精确比较（Quad / Glyph）
+    cmd: DrawCommand,
     clip: ?math.Rect,
 };
+
+fn paintedEql(a: PaintedItem, b: PaintedItem) bool {
+    return std.meta.eql(a.cmd, b.cmd);
+}
 
 fn flattenPainted(dl: *const DisplayList, allocator: std.mem.Allocator) ![]PaintedItem {
     var out: std.ArrayList(PaintedItem) = .empty;
@@ -276,20 +358,28 @@ fn flattenPainted(dl: *const DisplayList, allocator: std.mem.Allocator) ![]Paint
                 if (clip_stack.items.len > 0) _ = clip_stack.pop();
             },
             .quad => |q| {
-                const clip: ?math.Rect = if (clip_stack.items.len > 0)
-                    clip_stack.items[clip_stack.items.len - 1]
-                else
-                    null;
-                try out.append(allocator, .{ .quad = q, .clip = clip });
+                try out.append(allocator, .{
+                    .kind = .quad,
+                    .bounds = q.paintBounds(),
+                    .cmd = cmd,
+                    .clip = currentClip(clip_stack.items),
+                });
+            },
+            .glyph => |g| {
+                try out.append(allocator, .{
+                    .kind = .glyph,
+                    .bounds = g.paintBounds(),
+                    .cmd = cmd,
+                    .clip = currentClip(clip_stack.items),
+                });
             },
         }
     }
     return out.toOwnedSlice(allocator);
 }
 
-fn visibleBounds(q: Quad, clip: ?math.Rect) math.Rect {
-    const pb = q.paintBounds();
-    return if (clip) |c| pb.intersect(c) else pb;
+fn visiblePaintedBounds(item: PaintedItem) math.Rect {
+    return if (item.clip) |c| item.bounds.intersect(c) else item.bounds;
 }
 
 /// 计算某批次最终在物理像素上的裁剪矩形（将批裁剪区与可选脏区求交，再夹紧到帧缓冲范围）。
@@ -369,7 +459,7 @@ test "DisplayList batches consecutive quads with same clip and preserves painter
     var built = try dl.buildBatches(gpa);
     defer built.deinit(gpa);
 
-    try std.testing.expectEqual(@as(usize, 4), built.instances.len);
+    try std.testing.expectEqual(@as(usize, 4), built.quad_instances.len);
     try std.testing.expectEqual(@as(usize, 3), built.batches.len);
 
     try std.testing.expectEqual(@as(?math.Rect, null), built.batches[0].clip_rect);
@@ -384,6 +474,31 @@ test "DisplayList batches consecutive quads with same clip and preserves painter
     try std.testing.expectEqual(@as(?math.Rect, null), built.batches[2].clip_rect);
     try std.testing.expectEqual(@as(u32, 3), built.batches[2].instance_start);
     try std.testing.expectEqual(@as(u32, 1), built.batches[2].instance_count);
+    try std.testing.expectEqual(BatchKind.quad, built.batches[0].kind);
+}
+
+test "DisplayList splits batches when glyph and quad kinds alternate" {
+    const gpa = std.testing.allocator;
+    var dl = DisplayList.init(gpa);
+    defer dl.deinit();
+
+    try dl.pushQuad(.{ .bounds = math.Rect.init(0, 0, 10, 10), .background = math.Color.white });
+    try dl.pushGlyph(.{
+        .bounds = math.Rect.init(12, 0, 8, 10),
+        .uv = math.Rect.init(0, 0, 0.1, 0.1),
+        .color = math.Color.black,
+    });
+    try dl.pushQuad(.{ .bounds = math.Rect.init(22, 0, 10, 10), .background = math.Color.white });
+
+    var built = try dl.buildBatches(gpa);
+    defer built.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), built.quad_instances.len);
+    try std.testing.expectEqual(@as(usize, 1), built.glyph_instances.len);
+    try std.testing.expectEqual(@as(usize, 3), built.batches.len);
+    try std.testing.expectEqual(BatchKind.quad, built.batches[0].kind);
+    try std.testing.expectEqual(BatchKind.glyph, built.batches[1].kind);
+    try std.testing.expectEqual(BatchKind.quad, built.batches[2].kind);
 }
 
 test "DamageRegion computes union of changed quads including shadow padding" {

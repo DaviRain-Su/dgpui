@@ -18,6 +18,14 @@ pub const FrameParams = struct {
     /// Headless 后端会记录该值供断言；桌面 Swapchain 使用 LOADOP_CLEAR 时只按批裁剪区做 Scissor，
     /// 未来接入离屏持久画布（LOADOP_LOAD）时可直接复用 `scene.computePhysicalScissor` 做脏区局部重绘。
     damage_rect: ?math.Rect = null,
+    /// 可选字形图集（R8 灰度）。有 Glyph 批次时由渲染后端上传/绑定。
+    atlas_pixels: ?[]const u8 = null,
+    atlas_width: u32 = 0,
+    atlas_height: u32 = 0,
+    atlas_dirty: bool = false,
+    /// 输出：本帧是否真的把脏图集上传到了 GPU。
+    /// AppLoop 只有在这里被置 true 后才清 CPU 侧 dirty，避免 acquire 失败时丢上传。
+    atlas_uploaded: ?*bool = null,
 };
 
 pub const RendererBackend = struct {

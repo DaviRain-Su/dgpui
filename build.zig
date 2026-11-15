@@ -14,6 +14,13 @@ const SdlLocate = struct {
     how: []const u8,
 };
 
+const TextLocate = struct {
+    include_dirs: []const []const u8,
+    lib_dirs: []const []const u8,
+    use_pkg_config: bool,
+    how: []const u8,
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -28,7 +35,13 @@ pub fn build(b: *std.Build) void {
     }
     const sdl_on = if (sdl_force) |forced| forced else located != null;
 
+    const text_located = locateText(b) orelse {
+        std.process.fatal("HarfBuzz + FreeType2 were not found. Install them (`brew install harfbuzz freetype` / apt install libharfbuzz-dev libfreetype-dev) so pkg-config can see `harfbuzz` and `freetype2`.", .{});
+    };
+    std.log.info("text stack enabled via {s}", .{text_located.how});
+
     const headless_mod = makeCoreModule(b, target, optimize, false);
+    wireTextDeps(b, headless_mod, target, text_located);
     const headless_tests = b.addTest(.{ .root_module = headless_mod });
     const run_headless_tests = b.addRunArtifact(headless_tests);
 
@@ -62,9 +75,13 @@ pub fn build(b: *std.Build) void {
     for (where.include_dirs) |inc| {
         c_translate.addSystemIncludePath(.{ .cwd_relative = inc });
     }
+    for (text_located.include_dirs) |inc| {
+        c_translate.addSystemIncludePath(.{ .cwd_relative = inc });
+    }
     const c_mod = c_translate.createModule();
 
     const sdl_mod = makeCoreModule(b, target, optimize, true);
+    wireTextDeps(b, sdl_mod, target, text_located);
     sdl_mod.link_libc = true;
     sdl_mod.addImport("c", c_mod);
     for (where.lib_dirs) |lib| {
@@ -113,6 +130,80 @@ fn makeCoreModule(
     options.addOption(bool, "sdl", sdl);
     mod.addOptions("build_options", options);
     return mod;
+}
+
+fn wireTextDeps(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    text: TextLocate,
+) void {
+    mod.link_libc = true;
+
+    // Headless 测试也要能跑 HarfBuzz / FreeType，因此单独翻译 text_deps.h。
+    // SDL 模块已经通过 deps.h 引入了同一套头文件；这里仍给所有模块挂独立 c_text。
+    const text_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/c/text_deps.h"),
+        .target = target,
+        .optimize = .Debug,
+    });
+    for (text.include_dirs) |inc| {
+        text_translate.addSystemIncludePath(.{ .cwd_relative = inc });
+    }
+    const text_c = text_translate.createModule();
+    mod.addImport("c_text", text_c);
+
+    for (text.lib_dirs) |lib| {
+        mod.addLibraryPath(.{ .cwd_relative = lib });
+        mod.addRPath(.{ .cwd_relative = lib });
+    }
+    mod.linkSystemLibrary("harfbuzz", .{
+        .use_pkg_config = if (text.use_pkg_config) .yes else .no,
+    });
+    mod.linkSystemLibrary("freetype", .{
+        .use_pkg_config = if (text.use_pkg_config) .yes else .no,
+    });
+}
+
+fn locateText(b: *std.Build) ?TextLocate {
+    b.graph.poisonCache();
+    if (pkgConfigOk(b, &.{ "pkg-config", "--exists", "harfbuzz" }) and
+        pkgConfigOk(b, &.{ "pkg-config", "--exists", "freetype2" }))
+    {
+        const hb_cflags = pkgConfigStdout(b, &.{ "pkg-config", "--cflags-only-I", "harfbuzz" }) orelse "";
+        const ft_cflags = pkgConfigStdout(b, &.{ "pkg-config", "--cflags-only-I", "freetype2" }) orelse "";
+        const hb_libs = pkgConfigStdout(b, &.{ "pkg-config", "--libs-only-L", "harfbuzz" }) orelse "";
+        const ft_libs = pkgConfigStdout(b, &.{ "pkg-config", "--libs-only-L", "freetype2" }) orelse "";
+
+        var include_dirs = collectFlagValues(b, hb_cflags, "-I");
+        include_dirs = appendUniqueFlags(b, include_dirs, collectFlagValues(b, ft_cflags, "-I"));
+        var lib_dirs = collectFlagValues(b, hb_libs, "-L");
+        lib_dirs = appendUniqueFlags(b, lib_dirs, collectFlagValues(b, ft_libs, "-L"));
+
+        return .{
+            .include_dirs = include_dirs,
+            .lib_dirs = lib_dirs,
+            .use_pkg_config = true,
+            .how = "pkg-config harfbuzz+freetype2",
+        };
+    }
+    return null;
+}
+
+fn appendUniqueFlags(b: *std.Build, base: []const []const u8, extra: []const []const u8) []const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    list.appendSlice(b.allocator, base) catch @panic("OOM");
+    for (extra) |item| {
+        var found = false;
+        for (list.items) |existing| {
+            if (std.mem.eql(u8, existing, item)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) list.append(b.allocator, item) catch @panic("OOM");
+    }
+    return list.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
 
 fn locateSdl(b: *std.Build, include_opt: ?[]const u8, lib_opt: ?[]const u8) ?SdlLocate {

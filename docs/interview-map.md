@@ -2,7 +2,7 @@
 
 这份文档把 `dgpui` 的设计对应到 Rust GUI 岗位面试里的高频术语。
 
-> 截至 PR 1，代码里真正有的是 `PlatformBackend` / `RendererBackend`、Headless、SDL3 窗口和事件循环、`math.zig`。下文里的 `Entity`、`FrameArena`、`DisplayList`、HarfBuzz、Flex **都是目标设计，不是已经落地的代码**。没有单独标「已实现」的段落，默认是计划。实现是 AI 辅助的，设计与审查由本人负责。
+> 截至 PR 3，代码里真正有的是 `PlatformBackend` / `RendererBackend`、Headless、SDL3 窗口和事件循环、`FrameArena`、`DisplayList`、SDF Quad、HarfBuzz / FreeType / `GlyphAtlas`。下文里的 `Entity`、Flex、Hitbox **仍是目标设计**。没有单独标「已实现」的段落时，请对照对应 PR 文档。实现是 AI 辅助的，设计与审查由本人负责。
 
 ---
 
@@ -31,7 +31,7 @@
 2. **为什么用 `EntityId`（index + generation）而不是到处 `Rc<RefCell<T>>`？**
    - GUI 事件经常发生“A 的回调修改了 B，同时 B 正在遍历或又通知了 A”（重入借用冲突）。
    - 用句柄 + 中央 `EntityStore`（类似 SlotMap / generational arena），可以通过 `cx.update_entity(id, |state, cx| ...)` 集中控制可重入借用，避免 `RefCell` 运行时 panic。
-3. **FFI 与 `unsafe` 边界（当前是 SDL3；HarfBuzz / FreeType2 是后续计划）**
+3. **FFI 与 `unsafe` 边界（当前是 SDL3 + HarfBuzz + FreeType2）**
    - 本仓库不链接 Yoga。Flex 若要做，是手写的小引擎，只参考 Yoga / Taffy 的模型。
    - 底层 C 库需要手工管理生命周期、字节切片对齐和编码格式（UTF-8 到 glyph index），在 Rust 中应当把 `unsafe` 封装在极薄的安全 wrapper 模块内部（如 `FontSystem`、`PlatformBackend`），对外只暴露安全句柄和值类型。
    - 已实现的例子：`src/backend/sdl.zig` 把 SDL 事件翻译成值类型的 `platform.Event`，文本按码点边界拷进定长缓冲，不把 SDL 的指针漏到循环外面。
