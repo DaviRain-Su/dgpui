@@ -3,7 +3,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-pub const version = "0.1.0-pr8";
+pub const version = "0.1.0-pr9";
 
 pub const math = @import("math.zig");
 pub const arena = @import("arena.zig");

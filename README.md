@@ -66,6 +66,8 @@
 | 链式 DSL + 手写 Flex | **已实现（PR 4）** | `src/ui/` `src/layout/` |
 | EntityStore + Hitbox | **已实现（PR 5）** | `src/entity.zig` `src/hitbox.zig` |
 | Scroll + Focus + comptime DSL | **已实现（PR 6）** | `src/ui/scroll.zig` `src/input.zig` `src/ui/comptime_dsl.zig` |
+| Headless 端到端 smoke | **已实现（PR 7）** | `src/demo.zig` |
+| Shaped-text LRU 缓存 | **已实现（PR 9）** | `src/text/layout.zig`（稳态每帧 0 次 HarfBuzz） |
 | `Entity`、Hitbox、滚动、焦点 | **计划中** | 见 `docs/architecture.md` |
 
 ## 技术栈
