@@ -276,15 +276,31 @@ fn layoutChildren(node: *Node) void {
                 if (dir == .row) child.width += add else child.height += add;
             }
         }
-    } else if (free < -0.5 and total_shrink_weighted > 0) {
-        const need = -free;
-        for (node.children) |child| {
-            const main = if (dir == .row) child.width else child.height;
-            if (child.style.flex_shrink > 0 and main > 0) {
-                const weighted = child.style.flex_shrink * main;
-                const sub = need * (weighted / total_shrink_weighted);
-                if (dir == .row) child.width = @max(0, child.width - sub) else child.height = @max(0, child.height - sub);
+    } else if (free < -0.5) {
+        // 多轮 shrink：某节点缩到 0 后冻结，剩余压缩量继续分给其他可收缩节点。
+        var remaining = -free;
+        var guard: usize = 0;
+        while (remaining > 0.5 and guard < n + 2) : (guard += 1) {
+            var weight_sum: f32 = 0;
+            for (node.children) |child| {
+                const main = if (dir == .row) child.width else child.height;
+                if (child.style.flex_shrink > 0 and main > 0) {
+                    weight_sum += child.style.flex_shrink * main;
+                }
             }
+            if (weight_sum <= 0) break;
+
+            var consumed: f32 = 0;
+            for (node.children) |child| {
+                const main = if (dir == .row) child.width else child.height;
+                if (!(child.style.flex_shrink > 0 and main > 0)) continue;
+                const weighted = child.style.flex_shrink * main;
+                const sub = @min(main, remaining * (weighted / weight_sum));
+                if (dir == .row) child.width = main - sub else child.height = main - sub;
+                consumed += sub;
+            }
+            if (consumed <= 0.0001) break;
+            remaining -= consumed;
         }
     }
 
@@ -494,6 +510,19 @@ test "row shrink remeasures wrapped text height" {
     try std.testing.expectApproxEqAbs(@as(f32, 150), b.width, 0.01);
     try std.testing.expectEqual(@as(f32, 32), a.height);
     try std.testing.expectEqual(@as(f32, 32), b.height);
+}
+
+test "shrink redistributes leftover after a child hits zero" {
+    var a = Node{ .style = .{ .intrinsic = .{ .width = 10, .height = 10 }, .flex_shrink = 100 } };
+    var b = Node{ .style = .{ .intrinsic = .{ .width = 100, .height = 10 }, .flex_shrink = 1 } };
+    const kids = [_]*Node{ &a, &b };
+    var root = Node{
+        .style = .{ .direction = .row, .width = .{ .px = 50 }, .height = .{ .px = 10 }, .gap = 0 },
+        .children = &kids,
+    };
+    layout(&root, .{ .width = 50, .height = 10 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0), a.width, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), b.width, 0.01);
 }
 
 test "column flex_grow height is preserved after measure" {
