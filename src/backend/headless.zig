@@ -124,7 +124,7 @@ pub const HeadlessBackend = struct {
                     var built = try dl.buildBatches(self.allocator);
                     defer built.deinit(self.allocator);
                     self.last_batch_count = built.batches.len;
-                    self.last_instance_count = built.instances.len;
+                    self.last_instance_count = built.quad_instances.len + built.glyph_instances.len;
                 } else {
                     self.last_command_count = 0;
                     self.last_batch_count = 0;

@@ -16,6 +16,7 @@ const renderer = @import("renderer.zig");
 pub const available = true;
 
 const quad_shader_source = @embedFile("../shader/quad.metal");
+const glyph_shader_source = @embedFile("../shader/glyph.metal");
 
 const FrameUniforms = extern struct {
     viewport_w: f32,
@@ -33,6 +34,8 @@ pub const SdlError = error{
     ShaderCreateFailed,
     PipelineCreateFailed,
     BufferCreateFailed,
+    TextureCreateFailed,
+    SamplerCreateFailed,
     CommandBufferFailed,
 };
 
@@ -41,9 +44,18 @@ pub const SdlBackend = struct {
     window: *c.SDL_Window,
     gpu_device: *c.SDL_GPUDevice,
     quad_pipeline: *c.SDL_GPUGraphicsPipeline,
+    glyph_pipeline: *c.SDL_GPUGraphicsPipeline,
     quad_buffer: ?*c.SDL_GPUBuffer = null,
     quad_transfer_buffer: ?*c.SDL_GPUTransferBuffer = null,
     quad_buffer_capacity: usize = 0,
+    glyph_buffer: ?*c.SDL_GPUBuffer = null,
+    glyph_transfer_buffer: ?*c.SDL_GPUTransferBuffer = null,
+    glyph_buffer_capacity: usize = 0,
+    atlas_texture: ?*c.SDL_GPUTexture = null,
+    atlas_transfer_buffer: ?*c.SDL_GPUTransferBuffer = null,
+    atlas_sampler: ?*c.SDL_GPUSampler = null,
+    atlas_width: u32 = 0,
+    atlas_height: u32 = 0,
     redraw_event_type: u32,
     cursor_arrow: ?*c.SDL_Cursor,
     cursor_pointer: ?*c.SDL_Cursor,
@@ -109,6 +121,8 @@ pub const SdlBackend = struct {
 
         const quad_pipeline = try createQuadPipeline(gpu_device, window);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(gpu_device, quad_pipeline);
+        const glyph_pipeline = try createGlyphPipeline(gpu_device, window);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(gpu_device, glyph_pipeline);
 
         const redraw_event_type = c.SDL_RegisterEvents(1);
 
@@ -118,6 +132,7 @@ pub const SdlBackend = struct {
             .window = window,
             .gpu_device = gpu_device,
             .quad_pipeline = quad_pipeline,
+            .glyph_pipeline = glyph_pipeline,
             .redraw_event_type = redraw_event_type,
             .cursor_arrow = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_DEFAULT),
             .cursor_pointer = c.SDL_CreateSystemCursor(c.SDL_SYSTEM_CURSOR_POINTER),
@@ -198,6 +213,150 @@ pub const SdlBackend = struct {
         };
     }
 
+    fn createGlyphPipeline(gpu_device: *c.SDL_GPUDevice, window: *c.SDL_Window) !*c.SDL_GPUGraphicsPipeline {
+        var vs_info = std.mem.zeroes(c.SDL_GPUShaderCreateInfo);
+        vs_info.code = glyph_shader_source.ptr;
+        vs_info.code_size = glyph_shader_source.len;
+        vs_info.entrypoint = "glyph_vs";
+        vs_info.format = c.SDL_GPU_SHADERFORMAT_MSL;
+        vs_info.stage = c.SDL_GPU_SHADERSTAGE_VERTEX;
+        vs_info.num_uniform_buffers = 1;
+        vs_info.num_storage_buffers = 1;
+
+        const vs = c.SDL_CreateGPUShader(gpu_device, &vs_info) orelse {
+            std.log.err("SDL_CreateGPUShader (glyph_vs) failed: {s}", .{c.SDL_GetError()});
+            return SdlError.ShaderCreateFailed;
+        };
+        defer c.SDL_ReleaseGPUShader(gpu_device, vs);
+
+        var fs_info = std.mem.zeroes(c.SDL_GPUShaderCreateInfo);
+        fs_info.code = glyph_shader_source.ptr;
+        fs_info.code_size = glyph_shader_source.len;
+        fs_info.entrypoint = "glyph_fs";
+        fs_info.format = c.SDL_GPU_SHADERFORMAT_MSL;
+        fs_info.stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT;
+        fs_info.num_samplers = 1;
+
+        const fs = c.SDL_CreateGPUShader(gpu_device, &fs_info) orelse {
+            std.log.err("SDL_CreateGPUShader (glyph_fs) failed: {s}", .{c.SDL_GetError()});
+            return SdlError.ShaderCreateFailed;
+        };
+        defer c.SDL_ReleaseGPUShader(gpu_device, fs);
+
+        var color_target = std.mem.zeroes(c.SDL_GPUColorTargetDescription);
+        color_target.format = c.SDL_GetGPUSwapchainTextureFormat(gpu_device, window);
+        color_target.blend_state = .{
+            .enable_blend = true,
+            .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+            .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .color_blend_op = c.SDL_GPU_BLENDOP_ADD,
+            .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
+            .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
+            .color_write_mask = 0,
+            .enable_color_write_mask = false,
+            .padding1 = 0,
+            .padding2 = 0,
+        };
+
+        var pipe_info = std.mem.zeroes(c.SDL_GPUGraphicsPipelineCreateInfo);
+        pipe_info.vertex_shader = vs;
+        pipe_info.fragment_shader = fs;
+        pipe_info.primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        pipe_info.rasterizer_state.fill_mode = c.SDL_GPU_FILLMODE_FILL;
+        pipe_info.rasterizer_state.cull_mode = c.SDL_GPU_CULLMODE_NONE;
+        pipe_info.rasterizer_state.front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+        pipe_info.target_info.color_target_descriptions = &color_target;
+        pipe_info.target_info.num_color_targets = 1;
+
+        return c.SDL_CreateGPUGraphicsPipeline(gpu_device, &pipe_info) orelse {
+            std.log.err("SDL_CreateGPUGraphicsPipeline (glyph) failed: {s}", .{c.SDL_GetError()});
+            return SdlError.PipelineCreateFailed;
+        };
+    }
+
+    fn ensureGlyphBuffers(self: *SdlBackend, required_instances: usize) !void {
+        if (required_instances <= self.glyph_buffer_capacity and self.glyph_buffer != null and self.glyph_transfer_buffer != null) {
+            return;
+        }
+        const new_cap = @max(required_instances, @max(self.glyph_buffer_capacity * 2, 256));
+        const byte_size: u32 = @intCast(new_cap * @sizeOf(scene.GlyphInstance));
+
+        const new_buf = c.SDL_CreateGPUBuffer(self.gpu_device, &.{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = byte_size,
+            .props = 0,
+        }) orelse return SdlError.BufferCreateFailed;
+        errdefer c.SDL_ReleaseGPUBuffer(self.gpu_device, new_buf);
+
+        const new_tx = c.SDL_CreateGPUTransferBuffer(self.gpu_device, &.{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = byte_size,
+            .props = 0,
+        }) orelse return SdlError.BufferCreateFailed;
+
+        if (self.glyph_buffer) |old| c.SDL_ReleaseGPUBuffer(self.gpu_device, old);
+        if (self.glyph_transfer_buffer) |old| c.SDL_ReleaseGPUTransferBuffer(self.gpu_device, old);
+        self.glyph_buffer = new_buf;
+        self.glyph_transfer_buffer = new_tx;
+        self.glyph_buffer_capacity = new_cap;
+    }
+
+    fn ensureAtlasTexture(self: *SdlBackend, width: u32, height: u32) !void {
+        if (self.atlas_texture != null and self.atlas_width == width and self.atlas_height == height and self.atlas_sampler != null and self.atlas_transfer_buffer != null) {
+            return;
+        }
+        if (self.atlas_transfer_buffer) |tx| c.SDL_ReleaseGPUTransferBuffer(self.gpu_device, tx);
+        if (self.atlas_texture) |tex| c.SDL_ReleaseGPUTexture(self.gpu_device, tex);
+        if (self.atlas_sampler) |smp| c.SDL_ReleaseGPUSampler(self.gpu_device, smp);
+        self.atlas_transfer_buffer = null;
+        self.atlas_texture = null;
+        self.atlas_sampler = null;
+
+        const tex = c.SDL_CreateGPUTexture(self.gpu_device, &.{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_R8_UNORM,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = width,
+            .height = height,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        }) orelse return SdlError.TextureCreateFailed;
+        errdefer c.SDL_ReleaseGPUTexture(self.gpu_device, tex);
+
+        const tx = c.SDL_CreateGPUTransferBuffer(self.gpu_device, &.{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = width * height,
+            .props = 0,
+        }) orelse return SdlError.BufferCreateFailed;
+        errdefer c.SDL_ReleaseGPUTransferBuffer(self.gpu_device, tx);
+
+        const smp = c.SDL_CreateGPUSampler(self.gpu_device, &.{
+            .min_filter = c.SDL_GPU_FILTER_LINEAR,
+            .mag_filter = c.SDL_GPU_FILTER_LINEAR,
+            .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+            .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .mip_lod_bias = 0,
+            .min_lod = 0,
+            .max_lod = 0,
+            .enable_anisotropy = false,
+            .max_anisotropy = 0,
+            .enable_compare = false,
+            .compare_op = c.SDL_GPU_COMPAREOP_NEVER,
+            .props = 0,
+        }) orelse return SdlError.SamplerCreateFailed;
+
+        self.atlas_texture = tex;
+        self.atlas_transfer_buffer = tx;
+        self.atlas_sampler = smp;
+        self.atlas_width = width;
+        self.atlas_height = height;
+    }
+
     fn ensureQuadBuffers(self: *SdlBackend, required_instances: usize) !void {
         if (required_instances <= self.quad_buffer_capacity and self.quad_buffer != null and self.quad_transfer_buffer != null) {
             return;
@@ -227,8 +386,14 @@ pub const SdlBackend = struct {
 
     pub fn deinitSelf(self: *SdlBackend) void {
         self.pending_events.deinit(self.allocator);
+        if (self.atlas_transfer_buffer) |tx| c.SDL_ReleaseGPUTransferBuffer(self.gpu_device, tx);
+        if (self.atlas_texture) |tex| c.SDL_ReleaseGPUTexture(self.gpu_device, tex);
+        if (self.atlas_sampler) |smp| c.SDL_ReleaseGPUSampler(self.gpu_device, smp);
+        if (self.glyph_transfer_buffer) |tx| c.SDL_ReleaseGPUTransferBuffer(self.gpu_device, tx);
+        if (self.glyph_buffer) |buf| c.SDL_ReleaseGPUBuffer(self.gpu_device, buf);
         if (self.quad_transfer_buffer) |tx| c.SDL_ReleaseGPUTransferBuffer(self.gpu_device, tx);
         if (self.quad_buffer) |buf| c.SDL_ReleaseGPUBuffer(self.gpu_device, buf);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.gpu_device, self.glyph_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.gpu_device, self.quad_pipeline);
         if (self.cursor_arrow) |cur| c.SDL_DestroyCursor(cur);
         if (self.cursor_pointer) |cur| c.SDL_DestroyCursor(cur);
@@ -512,8 +677,14 @@ pub const SdlBackend = struct {
                 defer if (built) |*b| b.deinit(self.allocator);
                 if (params.display_list) |dl| {
                     built = try dl.buildBatches(self.allocator);
-                    if (built.?.instances.len > 0) {
-                        try self.ensureQuadBuffers(built.?.instances.len);
+                    if (built.?.quad_instances.len > 0) {
+                        try self.ensureQuadBuffers(built.?.quad_instances.len);
+                    }
+                    if (built.?.glyph_instances.len > 0) {
+                        try self.ensureGlyphBuffers(built.?.glyph_instances.len);
+                        if (params.atlas_pixels != null) {
+                            try self.ensureAtlasTexture(params.atlas_width, params.atlas_height);
+                        }
                     }
                 }
 
@@ -539,30 +710,65 @@ pub const SdlBackend = struct {
                 if (h != 0) self.pixel_height = h;
 
                 if (swapchain_tex) |tex| {
-                    // 1. 一次整块上传所有 QuadInstance 到 GPU Storage Buffer
+                    // 1) 上传实例缓冲 +（如有）图集纹理
                     if (built) |b| {
-                        if (b.instances.len > 0) {
-                            const tx = self.quad_transfer_buffer.?;
-                            if (c.SDL_MapGPUTransferBuffer(self.gpu_device, tx, true)) |mapped| {
-                                const dst: [*]scene.QuadInstance = @ptrCast(@alignCast(mapped));
-                                @memcpy(dst[0..b.instances.len], b.instances);
-                                c.SDL_UnmapGPUTransferBuffer(self.gpu_device, tx);
-
-                                if (c.SDL_BeginGPUCopyPass(cmd_buf)) |copy_pass| {
-                                    const byte_len: u32 = @intCast(b.instances.len * @sizeOf(scene.QuadInstance));
-                                    c.SDL_UploadToGPUBuffer(
-                                        copy_pass,
-                                        &.{ .transfer_buffer = tx, .offset = 0 },
-                                        &.{ .buffer = self.quad_buffer.?, .offset = 0, .size = byte_len },
-                                        true,
-                                    );
-                                    c.SDL_EndGPUCopyPass(copy_pass);
+                        const need_copy = (b.quad_instances.len > 0) or (b.glyph_instances.len > 0) or (params.atlas_dirty and params.atlas_pixels != null);
+                        if (need_copy) {
+                            if (c.SDL_BeginGPUCopyPass(cmd_buf)) |copy_pass| {
+                                if (b.quad_instances.len > 0) {
+                                    const tx = self.quad_transfer_buffer.?;
+                                    if (c.SDL_MapGPUTransferBuffer(self.gpu_device, tx, true)) |mapped| {
+                                        const dst: [*]scene.QuadInstance = @ptrCast(@alignCast(mapped));
+                                        @memcpy(dst[0..b.quad_instances.len], b.quad_instances);
+                                        c.SDL_UnmapGPUTransferBuffer(self.gpu_device, tx);
+                                        const byte_len: u32 = @intCast(b.quad_instances.len * @sizeOf(scene.QuadInstance));
+                                        c.SDL_UploadToGPUBuffer(
+                                            copy_pass,
+                                            &.{ .transfer_buffer = tx, .offset = 0 },
+                                            &.{ .buffer = self.quad_buffer.?, .offset = 0, .size = byte_len },
+                                            true,
+                                        );
+                                    }
                                 }
+                                if (b.glyph_instances.len > 0) {
+                                    const tx = self.glyph_transfer_buffer.?;
+                                    if (c.SDL_MapGPUTransferBuffer(self.gpu_device, tx, true)) |mapped| {
+                                        const dst: [*]scene.GlyphInstance = @ptrCast(@alignCast(mapped));
+                                        @memcpy(dst[0..b.glyph_instances.len], b.glyph_instances);
+                                        c.SDL_UnmapGPUTransferBuffer(self.gpu_device, tx);
+                                        const byte_len: u32 = @intCast(b.glyph_instances.len * @sizeOf(scene.GlyphInstance));
+                                        c.SDL_UploadToGPUBuffer(
+                                            copy_pass,
+                                            &.{ .transfer_buffer = tx, .offset = 0 },
+                                            &.{ .buffer = self.glyph_buffer.?, .offset = 0, .size = byte_len },
+                                            true,
+                                        );
+                                    }
+                                }
+                                if (params.atlas_dirty) {
+                                    if (params.atlas_pixels) |pixels| {
+                                        if (self.atlas_texture != null and self.atlas_transfer_buffer != null) {
+                                            const tx = self.atlas_transfer_buffer.?;
+                                            if (c.SDL_MapGPUTransferBuffer(self.gpu_device, tx, true)) |mapped| {
+                                                const dst: [*]u8 = @ptrCast(@alignCast(mapped));
+                                                @memcpy(dst[0..pixels.len], pixels);
+                                                c.SDL_UnmapGPUTransferBuffer(self.gpu_device, tx);
+                                                c.SDL_UploadToGPUTexture(
+                                                    copy_pass,
+                                                    &.{ .transfer_buffer = tx, .offset = 0, .pixels_per_row = params.atlas_width, .rows_per_layer = params.atlas_height },
+                                                    &.{ .texture = self.atlas_texture.?, .mip_level = 0, .layer = 0, .x = 0, .y = 0, .z = 0, .w = params.atlas_width, .h = params.atlas_height, .d = 1 },
+                                                    false,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                c.SDL_EndGPUCopyPass(copy_pass);
                             }
                         }
                     }
 
-                    // 2. 开启 RenderPass：清屏并逐批按 Scissor 绘制 Instanced SDF Quad
+                    // 2) RenderPass：按 Painter's Order 逐批切换管线
                     var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
                     color_target.texture = tex;
                     color_target.clear_color = .{
@@ -571,63 +777,69 @@ pub const SdlBackend = struct {
                         .b = params.clear_color.b,
                         .a = params.clear_color.a,
                     };
-                    // macOS Metal 交换链采用多帧环形缓冲，每帧取到的可能是上一两帧旧纹理，
-                    // 因此整帧保持 CLEAR，通过下方 SDL_SetGPUScissor 与批裁剪控制片元范围。
                     color_target.load_op = c.SDL_GPU_LOADOP_CLEAR;
                     color_target.store_op = c.SDL_GPU_STOREOP_STORE;
 
                     const pass = c.SDL_BeginGPURenderPass(cmd_buf, &color_target, 1, null);
                     if (pass) |p| {
                         if (built) |b| {
-                            if (b.instances.len > 0 and self.quad_buffer != null) {
-                                const fb_w = if (w != 0) w else self.pixel_width;
-                                const fb_h = if (h != 0) h else self.pixel_height;
+                            const fb_w = if (w != 0) w else self.pixel_width;
+                            const fb_h = if (h != 0) h else self.pixel_height;
+                            const full_scissor = c.SDL_Rect{
+                                .x = 0,
+                                .y = 0,
+                                .w = @intCast(fb_w),
+                                .h = @intCast(fb_h),
+                            };
 
-                                c.SDL_BindGPUGraphicsPipeline(p, self.quad_pipeline);
-                                const storage_bufs = [_]?*c.SDL_GPUBuffer{self.quad_buffer};
-                                c.SDL_BindGPUVertexStorageBuffers(p, 0, &storage_bufs, 1);
-
-                                const full_scissor = c.SDL_Rect{
-                                    .x = 0,
-                                    .y = 0,
-                                    .w = @intCast(fb_w),
-                                    .h = @intCast(fb_h),
-                                };
-
-                                for (b.batches) |batch| {
-                                    // 注意：因为上面 Swapchain 使用了 LOADOP_CLEAR（整帧清屏），
-                                    // 这里只能按批自身的 clip_rect 裁剪，绝不能再叠加 params.damage_rect，
-                                    // 否则静态未变化的元素在清屏后会被 Scissor 挡住而消失。
-                                    // （真正的局部增量绘制需要离屏持久 RenderTarget 或 LOADOP_LOAD 单缓冲。）
-                                    const maybe_sc = scene.computePhysicalScissor(
-                                        batch.clip_rect,
-                                        null,
-                                        params.logical_size,
-                                        fb_w,
-                                        fb_h,
-                                    );
-                                    if (maybe_sc) |sc| {
-                                        if (sc.isEmpty()) continue;
-                                        const sdl_sc = c.SDL_Rect{
-                                            .x = sc.x,
-                                            .y = sc.y,
-                                            .w = sc.w,
-                                            .h = sc.h,
-                                        };
-                                        c.SDL_SetGPUScissor(p, &sdl_sc);
-                                    } else {
-                                        c.SDL_SetGPUScissor(p, &full_scissor);
-                                    }
-
-                                    const uniforms = FrameUniforms{
-                                        .viewport_w = params.logical_size.width,
-                                        .viewport_h = params.logical_size.height,
-                                        .scale_factor = params.scale_factor,
-                                        .base_instance = batch.instance_start,
-                                    };
-                                    c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &uniforms, @sizeOf(FrameUniforms));
-                                    c.SDL_DrawGPUPrimitives(p, 6, batch.instance_count, 0, 0);
+                            var bound_kind: ?scene.BatchKind = null;
+                            for (b.batches) |batch| {
+                                const maybe_sc = scene.computePhysicalScissor(
+                                    batch.clip_rect,
+                                    null,
+                                    params.logical_size,
+                                    fb_w,
+                                    fb_h,
+                                );
+                                if (maybe_sc) |sc| {
+                                    if (sc.isEmpty()) continue;
+                                    const sdl_sc = c.SDL_Rect{ .x = sc.x, .y = sc.y, .w = sc.w, .h = sc.h };
+                                    c.SDL_SetGPUScissor(p, &sdl_sc);
+                                } else {
+                                    c.SDL_SetGPUScissor(p, &full_scissor);
                                 }
+
+                                if (bound_kind != batch.kind) {
+                                    switch (batch.kind) {
+                                        .quad => {
+                                            if (self.quad_buffer == null) continue;
+                                            c.SDL_BindGPUGraphicsPipeline(p, self.quad_pipeline);
+                                            const storage_bufs = [_]?*c.SDL_GPUBuffer{self.quad_buffer};
+                                            c.SDL_BindGPUVertexStorageBuffers(p, 0, &storage_bufs, 1);
+                                        },
+                                        .glyph => {
+                                            if (self.glyph_buffer == null or self.atlas_texture == null or self.atlas_sampler == null) continue;
+                                            c.SDL_BindGPUGraphicsPipeline(p, self.glyph_pipeline);
+                                            const storage_bufs = [_]?*c.SDL_GPUBuffer{self.glyph_buffer};
+                                            c.SDL_BindGPUVertexStorageBuffers(p, 0, &storage_bufs, 1);
+                                            const samp = c.SDL_GPUTextureSamplerBinding{
+                                                .texture = self.atlas_texture,
+                                                .sampler = self.atlas_sampler,
+                                            };
+                                            c.SDL_BindGPUFragmentSamplers(p, 0, &samp, 1);
+                                        },
+                                    }
+                                    bound_kind = batch.kind;
+                                }
+
+                                const uniforms = FrameUniforms{
+                                    .viewport_w = params.logical_size.width,
+                                    .viewport_h = params.logical_size.height,
+                                    .scale_factor = params.scale_factor,
+                                    .base_instance = batch.instance_start,
+                                };
+                                c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &uniforms, @sizeOf(FrameUniforms));
+                                c.SDL_DrawGPUPrimitives(p, 6, batch.instance_count, 0, 0);
                             }
                         }
                         c.SDL_EndGPURenderPass(p);

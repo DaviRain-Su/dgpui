@@ -3,11 +3,12 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-pub const version = "0.1.0-pr2";
+pub const version = "0.1.0-pr3";
 
 pub const math = @import("math.zig");
 pub const arena = @import("arena.zig");
 pub const scene = @import("scene.zig");
+pub const text = @import("text/root.zig");
 pub const app = @import("app.zig");
 pub const backend = struct {
     pub const platform = @import("backend/platform.zig");

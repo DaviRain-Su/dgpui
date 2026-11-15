@@ -39,7 +39,7 @@
 
 ## 这个项目为什么要这么拆分？
 
-很多 GUI 教程上来就堆几十个文件。为了方便**边做边学、按 PR 逐个复习**，路线图拆成 **6 个 PR**。PR 1 已实现，PR 2–6 还没开始写代码：
+很多 GUI 教程上来就堆几十个文件。为了方便**边做边学、按 PR 逐个复习**，路线图拆成 **6 个 PR**。PR 1–3 已实现，PR 4–6 还在路上：
 
 | PR | 分支名 | 解决什么问题（大白话） | 对应的核心技术 / 面试高频点 |
 | :--- | :--- | :--- | :--- |
@@ -59,14 +59,15 @@
 | 几何（`Point` / `Rect` / `Color`） | **已实现** | `src/math.zig` |
 | 平台 / 渲染 VTable、Headless、事件循环 | **已实现** | `src/backend/platform.zig`、`renderer.zig`、`headless.zig`、`src/app.zig` |
 | SDL3 窗口、`SDL_GPU` 清屏、鼠标键盘、文本与 IME 事件 | **已实现**（机器上有 SDL3 开发包才编译） | `src/backend/sdl.zig` |
-| `damage_rect` | **只接到渲染接口**。SDL 仍整屏 `LOADOP_CLEAR`，局部重绘是 PR 2 | `src/backend/renderer.zig` |
-| `FrameArena`、`DisplayList`、SDF、HarfBuzz、FreeType、Flex、`Entity`、Hitbox、滚动、焦点 | **计划中** | 见 `docs/architecture.md`，仓库里还没有这些文件 |
+| `damage_rect` / `DamageRegion` | **已计算并接到后端**。桌面端 Swapchain 仍整屏 `LOADOP_CLEAR`；Scissor 执行 clip 栈 | `src/scene.zig` / `src/backend/sdl.zig` |
+| `FrameArena`、`DisplayList`、SDF Quad、HarfBuzz、FreeType、`GlyphAtlas` | **已实现（PR 2–3）** | `src/arena.zig` `src/scene.zig` `src/text/` `src/shader/` |
+| Flex、`Entity`、Hitbox、滚动、焦点 | **计划中** | 见 `docs/architecture.md` |
 
 ## 技术栈
 
 - **语言**：Zig `0.17.1`
 - **当前依赖**：`SDL3` + `SDL_GPU`（macOS 上 SDL_GPU 走 Metal）。没有 SDL3 时，headless 测试照样能编、能跑。
-- **计划中的依赖**：HarfBuzz、FreeType2、自写 `GlyphAtlas`。布局打算自己写一个小 Flex，只参考 Yoga / Taffy 的模型，**不链接 Yoga**。
+- **已接入依赖**：SDL3、HarfBuzz、FreeType2、自写 `GlyphAtlas`。布局打算自己写一个小 Flex，只参考 Yoga / Taffy 的模型，**不链接 Yoga**。
 - **写法**：AI 辅助实现，本人负责设计与审查。关键路径（事件循环、像素尺寸、文本截断）留在仓库里，不包一层不透明库。
 
 ---

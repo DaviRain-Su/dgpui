@@ -58,7 +58,7 @@
 
 ---
 
-### Step 2：渲染中间层（`DisplayList`）、脏区（`DamageRegion`）与 SDF 着色器——计划中，还没有代码
+### Step 2：渲染中间层（`DisplayList`）、脏区（`DamageRegion`）与 SDF 着色器——已实现（见 `docs/pr2-scene-and-sdf-quad.md`）
 
 - **解决什么问题**：如果布局完直接调 GPU API，代码会耦合死，也没法做局部重绘和单元测试。
 - **怎么做**：
@@ -75,7 +75,7 @@
 
 ---
 
-### Step 3：文字排版与字形图集（HarfBuzz + FreeType2 + `GlyphAtlas`）——计划中，还没有代码
+### Step 3：文字排版与字形图集（HarfBuzz + FreeType2 + `GlyphAtlas`）——已实现（见 `docs/pr3-text-shaping-and-atlas.md`）
 
 - **解决什么问题**：GPU 不认识 `.ttf` 字体文件。而且一行字里可能有英文连字（`fi`）、中英文混排，每个字宽都不同。
 - **三条流水线**：

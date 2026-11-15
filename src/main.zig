@@ -4,6 +4,19 @@ const dgpui = @import("dgpui");
 const DemoState = struct {
     clicks: usize = 0,
     accent_on: bool = false,
+    text_system: dgpui.text.TextSystem = undefined,
+    text_ready: bool = false,
+
+    fn setupText(self: *DemoState, gpa: std.mem.Allocator) !void {
+        const path = dgpui.text.font.defaultFontPath();
+        try self.text_system.init(gpa, path.ptr, 1024, 1024);
+        self.text_ready = true;
+    }
+
+    fn deinitText(self: *DemoState) void {
+        if (self.text_ready) self.text_system.deinit();
+        self.text_ready = false;
+    }
 
     fn onEvent(ctx: *anyopaque, ev: dgpui.backend.platform.Event, loop: *dgpui.app.AppLoop) void {
         const self: *DemoState = @ptrCast(@alignCast(ctx));
@@ -29,13 +42,11 @@ const DemoState = struct {
     ) !void {
         const self: *DemoState = @ptrCast(@alignCast(ctx));
 
-        // 居中摆放一张 420x260 的信息卡片骨架（展示阴影 + 圆角 + 1px 边框 + Scissor 裁剪）
-        const card_w: f32 = @min(420.0, @max(200.0, metrics.logical_width - 64.0));
-        const card_h: f32 = 250.0;
+        const card_w: f32 = @min(460.0, @max(240.0, metrics.logical_width - 64.0));
+        const card_h: f32 = 280.0;
         const card_x = (metrics.logical_width - card_w) * 0.5;
         const card_y = (metrics.logical_height - card_h) * 0.5;
 
-        // 1. 卡片主体（一个 SDF Quad 同时画出柔和阴影 + 圆角填充 + 1px 描边）
         try dl.pushQuad(.{
             .bounds = dgpui.math.Rect.init(card_x, card_y, card_w, card_h),
             .background = dgpui.math.Color.fromHex(0x24273a),
@@ -47,27 +58,56 @@ const DemoState = struct {
             .shadow_offset = .{ .x = 0, .y = 8 },
         });
 
-        // 2. 顶部“标题占位条”（PR 3 会把真正的文字画在这里）
-        try dl.pushQuad(.{
-            .bounds = dgpui.math.Rect.init(card_x + 24, card_y + 24, card_w - 48, 28),
-            .background = dgpui.math.Color.fromHex(0xcad3f5),
-            .corner_radius = 6.0,
-        });
+        if (self.text_ready) {
+            const title_color = dgpui.math.Color.fromHex(0xcad3f5);
+            const body_color = dgpui.math.Color.fromHex(0xa5adce);
+            const accent = dgpui.math.Color.fromHex(if (self.accent_on) 0xa6da95 else 0x8aadf4);
 
-        // 3. 正文占位条两行
-        try dl.pushQuad(.{
-            .bounds = dgpui.math.Rect.init(card_x + 24, card_y + 68, card_w - 48, 14),
-            .background = dgpui.math.Color.fromHex(0x8087a2),
-            .corner_radius = 4.0,
-        });
-        try dl.pushQuad(.{
-            .bounds = dgpui.math.Rect.init(card_x + 24, card_y + 92, (card_w - 48) * 0.7, 14),
-            .background = dgpui.math.Color.fromHex(0x6e738d),
-            .corner_radius = 4.0,
-        });
+            var title = try self.text_system.prepareLine(
+                "dgpui · Text Shaping",
+                .{ .x = card_x + 24, .y = card_y + 22 },
+                22,
+                metrics.scale_factor,
+                title_color,
+            );
+            defer title.deinit(self.text_system.allocator);
+            for (title.glyphs) |g| try dl.pushGlyph(.{ .bounds = g.bounds, .uv = g.uv, .color = g.color });
 
-        // 4. 演示 Scissor 裁剪栈：把一个故意画超宽的进度条限制在圆角容器内
-        const clip_box = dgpui.math.Rect.init(card_x + 24, card_y + 126, card_w - 48, 28);
+            var body = try self.text_system.prepareLine(
+                "HarfBuzz + FreeType + GlyphAtlas",
+                .{ .x = card_x + 24, .y = card_y + 58 },
+                15,
+                metrics.scale_factor,
+                body_color,
+            );
+            defer body.deinit(self.text_system.allocator);
+            for (body.glyphs) |g| try dl.pushGlyph(.{ .bounds = g.bounds, .uv = g.uv, .color = g.color });
+
+            var mixed = try self.text_system.prepareLine(
+                "Hello 世界 · 点击切换高亮",
+                .{ .x = card_x + 24, .y = card_y + 90 },
+                16,
+                metrics.scale_factor,
+                accent,
+            );
+            defer mixed.deinit(self.text_system.allocator);
+            for (mixed.glyphs) |g| try dl.pushGlyph(.{ .bounds = g.bounds, .uv = g.uv, .color = g.color });
+
+            var counter_buf: [64]u8 = undefined;
+            const counter_text = try std.fmt.bufPrint(&counter_buf, "clicks = {d}", .{self.clicks});
+            var counter = try self.text_system.prepareLine(
+                counter_text,
+                .{ .x = card_x + 24, .y = card_y + 130 },
+                18,
+                metrics.scale_factor,
+                title_color,
+            );
+            defer counter.deinit(self.text_system.allocator);
+            for (counter.glyphs) |g| try dl.pushGlyph(.{ .bounds = g.bounds, .uv = g.uv, .color = g.color });
+        }
+
+        // Scissor 演示：故意超宽的进度条，限制在圆角槽内
+        const clip_box = dgpui.math.Rect.init(card_x + 24, card_y + 180, card_w - 48, 28);
         try dl.pushQuad(.{
             .bounds = clip_box,
             .background = dgpui.math.Color.fromHex(0x181926),
@@ -83,32 +123,40 @@ const DemoState = struct {
         });
         try dl.popClip();
 
-        // 5. 底部两个圆角标签 + 右侧交互按钮骨架
         try dl.pushQuad(.{
-            .bounds = dgpui.math.Rect.init(card_x + 24, card_y + 184, 88, 34),
-            .background = dgpui.math.Color.fromHex(0x363a4f),
-            .corner_radius = 17.0,
-        });
-        try dl.pushQuad(.{
-            .bounds = dgpui.math.Rect.init(card_x + 122, card_y + 184, 72, 34),
-            .background = dgpui.math.Color.fromHex(0x363a4f),
-            .corner_radius = 17.0,
-        });
-        try dl.pushQuad(.{
-            .bounds = dgpui.math.Rect.init(card_x + card_w - 124, card_y + 184, 100, 34),
+            .bounds = dgpui.math.Rect.init(card_x + card_w - 124, card_y + 224, 100, 34),
             .background = dgpui.math.Color.fromHex(if (self.accent_on) 0xf5a97f else 0x8aadf4),
             .corner_radius = 10.0,
         });
+    }
+
+    fn atlasFrame(ctx: *anyopaque) ?dgpui.app.AtlasFrame {
+        const self: *DemoState = @ptrCast(@alignCast(ctx));
+        if (!self.text_ready) return null;
+        return .{
+            .pixels = self.text_system.atlas.pixels,
+            .width = self.text_system.atlas.width,
+            .height = self.text_system.atlas.height,
+            .dirty = self.text_system.atlas.dirty,
+        };
+    }
+
+    fn atlasClearDirty(ctx: *anyopaque) void {
+        const self: *DemoState = @ptrCast(@alignCast(ctx));
+        if (self.text_ready) self.text_system.atlas.dirty = false;
     }
 };
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
-    const sdl = try dgpui.backend.sdl.SdlBackend.init(gpa, "dgpui — PR 2: DisplayList & SDF Quads", 800, 600);
+    const sdl = try dgpui.backend.sdl.SdlBackend.init(gpa, "dgpui — PR 3: Text Shaping & GlyphAtlas", 840, 620);
     defer sdl.deinitSelf();
 
     var state = DemoState{};
+    try state.setupText(gpa);
+    defer state.deinitText();
+
     var loop = dgpui.app.AppLoop.init(gpa, sdl.platformBackend(), sdl.rendererBackend());
     defer loop.deinit();
     loop.clear_color = dgpui.math.Color.fromHex(0x181926);
@@ -116,6 +164,8 @@ pub fn main(init: std.process.Init) !void {
         .ctx = &state,
         .onEvent = DemoState.onEvent,
         .onRender = DemoState.onRender,
+        .atlasFrame = DemoState.atlasFrame,
+        .atlasClearDirty = DemoState.atlasClearDirty,
     };
 
     try loop.run();
