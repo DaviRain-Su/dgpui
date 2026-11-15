@@ -2,7 +2,7 @@
 
 这份文档把 `dgpui` 的设计对应到 Rust GUI 岗位面试里的高频术语。
 
-> 截至 PR 3，代码里真正有的是 `PlatformBackend` / `RendererBackend`、Headless、SDL3 窗口和事件循环、`FrameArena`、`DisplayList`、SDF Quad、HarfBuzz / FreeType / `GlyphAtlas`。下文里的 `Entity`、Flex、Hitbox **仍是目标设计**。没有单独标「已实现」的段落时，请对照对应 PR 文档。实现是 AI 辅助的，设计与审查由本人负责。
+> **现状（PR 1–6 已合并到 `main`）**：多后端、`FrameArena`、`DisplayList`/Damage、SDF Quad、HarfBuzz/FreeType/`GlyphAtlas`、链式 DSL + 手写 Flex、`EntityStore`/`Hitbox`、滚动/焦点、以及 comptime DSL 对比都已有代码。口述提纲见 [`docs/interview-qa.md`](interview-qa.md)。实现是 AI 辅助的，设计与审查由本人负责。
 
 ---
 
@@ -22,19 +22,18 @@
 
 ## 2. Rust 所有权与内存模型（把 Zig 翻译成 Rust）
 
-在 `dgpui` 里你会亲手写出两个分配器，面试官问 Rust 所有权时可以直接画出来：
+在 `dgpui` 里有两个分配世界，面试官问 Rust 所有权时可以直接画出来：
 
 1. **为什么会有 `'frame` 生命周期 / 为什么回调不能指向帧 Arena？**
-   - 在 `dgpui` 中，`Div` / `Text` 节点和布局节点全分配在 `FrameArena`，每一帧结束执行 `reset()`。
-   - 对应的 Rust 视角：Element 树借用了帧作用域 `&'frame FrameArena`，而点击回调必须放进跨帧存活的堆或槽位池里（要求 `'static` 或只捕获 `Entity<T>` / `WeakEntity<T>` 句柄）。
-   - 如果回调强行持有 `&'frame Element`，Rust Borrow Checker 会直接报错拒绝编译；在 Zig 里一旦持有悬垂指针就是 UB。
+   - `Div` / `Text` 与布局节点分配在 `FrameArena`，帧末 `reset()`（见 `src/arena.zig`、`src/ui/element.zig`）。
+   - Rust 视角：Element 树借用 `&'frame FrameArena`；点击回调必须 `'static` 或只捕获 `EntityId`。
+   - Zig 里若回调持有 `Element*`，下一帧就是悬垂指针。
 2. **为什么用 `EntityId`（index + generation）而不是到处 `Rc<RefCell<T>>`？**
-   - GUI 事件经常发生“A 的回调修改了 B，同时 B 正在遍历或又通知了 A”（重入借用冲突）。
-   - 用句柄 + 中央 `EntityStore`（类似 SlotMap / generational arena），可以通过 `cx.update_entity(id, |state, cx| ...)` 集中控制可重入借用，避免 `RefCell` 运行时 panic。
-3. **FFI 与 `unsafe` 边界（当前是 SDL3 + HarfBuzz + FreeType2）**
-   - 本仓库不链接 Yoga。Flex 若要做，是手写的小引擎，只参考 Yoga / Taffy 的模型。
-   - 底层 C 库需要手工管理生命周期、字节切片对齐和编码格式（UTF-8 到 glyph index），在 Rust 中应当把 `unsafe` 封装在极薄的安全 wrapper 模块内部（如 `FontSystem`、`PlatformBackend`），对外只暴露安全句柄和值类型。
-   - 已实现的例子：`src/backend/sdl.zig` 把 SDL 事件翻译成值类型的 `platform.Event`，文本按码点边界拷进定长缓冲，不把 SDL 的指针漏到循环外面。
+   - 已实现：`src/entity.zig`。generation 防 slot 复用；`observe/notify` 把脏 view 放进 set，同轮合并。
+   - 对应 Rust：SlotMap / generational arena + `cx.update_entity`，规避重入 `RefCell` panic。
+3. **FFI 与 `unsafe` 边界（SDL3 + HarfBuzz + FreeType2）**
+   - Flex 是手写的（`src/layout/flex.zig`），不链接 Yoga/Taffy。
+   - SDL 事件译成值类型 `platform.Event`；文本按码点拷进定长缓冲，不把 C 指针漏出事件循环。
 
 ---
 
@@ -42,26 +41,37 @@
 
 面试常问：**`wgpu`、`Vello`、`Skia`、`FemtoVG` 分别干什么？为什么不止用其中一个？**
 
-- **`wgpu`（以及 `dgpui` 里的 `SDL_GPU`）**：**底层 GPU 硬件抽象层**（类似 Vulkan/Metal/DX12 的统一安全接口）。它只管 Buffer、Texture、Pipeline、Shader 和 Draw Call，**它自己不懂什么是圆角矩形或贝塞尔曲线**。
-- **`dgpui` 自写 SDF 着色器 + `GlyphAtlas`**：相当于用最精简的代码直接跑在 `wgpu` / `SDL_GPU` 上，专门解决“大量 UI 盒子 + 文本”的高性能绘制，**缺点是不擅长任意复杂矢量路径（如 SVG 复杂钢笔曲线）**。
-- **`Skia`**：老牌全能 2D 图形库（CPU 光栅化 + GPU 后端），Flutter/Chrome 都在用，功能极全但体积庞大、C++ FFI 较重。
-- **`FemtoVG`**：轻量级 OpenGL / wgpu 矢量绘图库（类似 HTML Canvas 2D API），把路径三角化后画在 GPU 上。
-- **`Vello`**：纯 Rust 现代 GPU-first 2D 矢量渲染引擎，**核心利用 GPU Compute Shader（计算着色器）做并行路径光栅化**，跑在 `wgpu` 之上。
+- **`wgpu`（以及 `dgpui` 里的 `SDL_GPU`）**：**底层 GPU 硬件抽象层**。管 Buffer/Texture/Pipeline/Draw Call，**不懂**圆角矩形或贝塞尔。
+- **`dgpui` 自写 SDF 着色器 + `GlyphAtlas`**：跑在 `SDL_GPU`/Metal 上，专门画大量 UI 盒子 + 文本；不擅长任意复杂矢量路径。
+- **`Skia` / `FemtoVG` / `Vello`**：分别是全能 2D、轻量路径、GPU compute 路径光栅——需要复杂矢量时再引入，不是「有了 wgpu 就有 UI」。
 
 ### 局部重绘（Damage Region）与裁剪（Scissor）
-- **计划中的策略**：**脏视图触发重建 DisplayList -> 计算变化的 Damage Bounds（脏矩形并集）-> 渲染后端根据 Damage Region + Scissor Rect 控制重绘边界**。
-- **PR 1 的现状**：`FrameParams.damage_rect` 已经在渲染接口上，Headless / SDL 都会把它记下来。SDL 这一帧仍然 `LOADOP_CLEAR` 整屏，没有 scissor。`null` 表示整屏。
-- 注意表述边界：除非专门实现了离屏纹理缓存（Offscreen Layer Cache / RenderTarget Cache），否则不要把“脏矩形计算 + Scissor 裁剪”夸大成“完整的多层离屏图层缓存”。
+- **已实现**：`DamageRegion.fromDisplayListDiff`；batch 按 clip 分批并 `SDL_SetGPUScissor`。
+- **诚实边界**：swapchain 仍 `LOADOP_CLEAR`。因此 **不能**只按 `damage_rect` 做 scissor 跳过静态区，否则 clear 后静态内容消失。真增量重绘需要离屏 retained canvas + `LOADOP_LOAD`（未做）。
 
 ### 桌面窗口后端 vs 嵌入式 DRM/KMS
-- **桌面端（`winit` / `SDL3` / `GLFW` / 原生 AppKit `CAMetalLayer`）**：操作系统已有窗口管理器（Compositor），框架只需要向系统申请一个 Surface（矩形画布），接收系统转发的键盘鼠标事件。
-- **嵌入式 Linux（`DRM/KMS` + `libinput`）**：没有 X11/Wayland 窗口管理器，程序直接通过内核 DRM 接口申请显卡帧缓冲（Framebuffer/GBM），画完后直接提交给显示控制器做 **Scanout（扫描输出）**，输入事件直接从 `/dev/input`（`libinput`）读。
-- 在 `dgpui` 中，只要把 `PlatformBackend` 和 `RendererBackend` 两个抽象接口抽干净，**换后端无需改动上层 1 行布局/状态/DSL 代码**——这正是 Slint 多后端架构的核心思想。
+- 桌面：`SDL3` 申请 Surface，收系统事件。
+- 嵌入式：`DRM/KMS` + `libinput` 直接 scanout。
+- `PlatformBackend` + `RendererBackend` 抽干净后，上层 DSL/布局/Entity **不用改**——Slint 多后端同一思想。
 
 ---
 
 ## 4. 声明式 DSL 与 Rust 过程宏（`proc-macro`）的取舍
 
-- **链式 Builder（GPUI / `dgpui`）**：无需编译器扩展，IDE 自动补全极好，动态条件渲染直接写普通 `if / for`，但嵌套深时样板代码略多。
-- **Rust `proc-macro`（属性宏 / 函数式宏如 `rsx!` / `view!`）**：在编译期把类 HTML/XML 标记的 `TokenStream` 展开成 Builder 调用或直接展开成更新代码，开发体验接近前端，但报错信息定位和编译耗时是成本。
-- **外部独立编译器（如 Slint 的 `.slint` -> Rust/C++）**：脱离宿主语言语法限制，可以在编译期做跨语言代码生成与**静态属性依赖图优化**，实现极小运行期开销，代价是必须维护一整套独立词法/语法分析器与 IDE 插件（LSP）。
+- **链式 Builder（已实现，主路径）**：`src/ui/element.zig` — `div().flexCol().p(16).child(text(...))`。动态列表/条件自然。
+- **comptime 静态表（PR 6 教育对比）**：`src/ui/comptime_dsl.zig` — 编译期形状 → 运行期实例化到 FrameArena。
+- **Rust `proc-macro` / `.slint` 编译器**：更强静态检查与依赖分析，代价是宏/编译器复杂度与报错体验。
+
+---
+
+## 5. 事件闭环（已实现）
+
+| 步骤 | 代码 |
+| --- | --- |
+| Paint 登记 Hitbox | `ui.paintTreeHit` |
+| 倒序命中 + 冒泡 | `hitbox.HitList.dispatchClick` |
+| 改持久状态 + notify | `entity.EntityStore` |
+| 键盘进焦点 | `input.FocusManager` |
+| 滚动裁剪 | `ui.paintScroll` + `ScrollState` |
+
+详见各 PR 文档与 [`interview-qa.md`](interview-qa.md)。
